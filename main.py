@@ -64,6 +64,13 @@ def _as_list(
     return list(fallback)
 
 
+def _as_float(value, fallback: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
 def _resolve_mention_keywords(config) -> list[str]:
     mention_keywords = _as_list(
         config.get("mention_keywords"),
@@ -131,6 +138,23 @@ class Main(Star):
         self.active_reply_cooldown_sec = float(
             self.config.get("active_reply_cooldown_sec", 30),
         )
+        self.directed_reply_guard_enabled = bool(
+            self.config.get("directed_reply_guard_enabled", True),
+        )
+        self.directed_reply_group_cooldown_sec = _as_float(
+            self.config.get("directed_reply_group_cooldown_sec"),
+            8,
+        )
+        self.directed_reply_sender_cooldown_sec = _as_float(
+            self.config.get("directed_reply_sender_cooldown_sec"),
+            60,
+        )
+        self.directed_reply_owner_bypass = bool(
+            self.config.get("directed_reply_owner_bypass", True),
+        )
+        self.owner_ids = set(
+            _as_list(self.config.get("owner_ids"), [], split_string=True),
+        )
         self.mention_keywords = _resolve_mention_keywords(self.config)
         self.aliases = list(self.mention_keywords)
         RUNTIME_ALIASES = list(self.mention_keywords)
@@ -143,15 +167,47 @@ class Main(Star):
             self.mention_keywords,
         )
         self._last_active_reply_at: dict[str, float] = {}
+        self._last_directed_group_at: dict[str, float] = {}
+        self._last_directed_sender_at: dict[str, float] = {}
 
     async def initialize(self) -> None:
         logger.info(
-            "%s loaded: mention_keywords=%s, use_llm_judge=%s, active_reply_enabled=%s",
+            "%s loaded: mention_keywords=%s, use_llm_judge=%s, active_reply_enabled=%s, directed_guard=%s",
             PLUGIN_TAG,
             ",".join(self.mention_keywords),
             self.use_llm_judge,
             self.active_reply_enabled,
+            self.directed_reply_guard_enabled,
         )
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=-100)
+    async def directed_reply_guard(self, event: AstrMessageEvent) -> None:
+        if not self.directed_reply_guard_enabled:
+            return
+        if self._is_self_message(event):
+            return
+        if self.directed_reply_owner_bypass and self._is_owner_message(event):
+            return
+        if not self._has_native_directed_signal(event):
+            return
+
+        allowed, reason = self._consume_directed_reply_slot(event)
+        if allowed:
+            return
+
+        text = event.get_message_str().strip()
+        event.set_extra(EXTRA_DECISION, "SKIP")
+        event.set_extra(EXTRA_REASON, reason)
+        event.set_extra(EXTRA_MODE, "directed_guard")
+        logger.info(
+            "%s directed skip: group=%s sender=%s reason=%s text=%s",
+            PLUGIN_TAG,
+            event.get_group_id(),
+            event.get_sender_id(),
+            reason,
+            _clip(text),
+        )
+        event.stop_event()
 
     @filter.custom_filter(MentionAliasFilter, priority=20)
     async def smart_mention(self, event: AstrMessageEvent) -> None:
@@ -306,6 +362,49 @@ class Main(Star):
         return bool(event.get_self_id()) and str(event.get_sender_id()) == str(
             event.get_self_id(),
         )
+
+    def _is_owner_message(self, event: AstrMessageEvent) -> bool:
+        return str(event.get_sender_id()) in self.owner_ids
+
+    def _consume_directed_reply_slot(
+        self,
+        event: AstrMessageEvent,
+        *,
+        now: float | None = None,
+    ) -> tuple[bool, str]:
+        now = monotonic() if now is None else now
+        group_key = self._directed_group_key(event)
+        sender_key = self._directed_sender_key(event)
+
+        group_elapsed = now - self._last_directed_group_at.get(group_key, 0)
+        if (
+            self.directed_reply_group_cooldown_sec > 0
+            and group_elapsed < self.directed_reply_group_cooldown_sec
+        ):
+            return (
+                False,
+                f"group_cooldown:{group_elapsed:.1f}/{self.directed_reply_group_cooldown_sec:.1f}s",
+            )
+
+        sender_elapsed = now - self._last_directed_sender_at.get(sender_key, 0)
+        if (
+            self.directed_reply_sender_cooldown_sec > 0
+            and sender_elapsed < self.directed_reply_sender_cooldown_sec
+        ):
+            return (
+                False,
+                f"sender_cooldown:{sender_elapsed:.1f}/{self.directed_reply_sender_cooldown_sec:.1f}s",
+            )
+
+        self._last_directed_group_at[group_key] = now
+        self._last_directed_sender_at[sender_key] = now
+        return True, "allowed"
+
+    def _directed_group_key(self, event: AstrMessageEvent) -> str:
+        return f"{event.unified_msg_origin}:bot:{event.get_self_id()}"
+
+    def _directed_sender_key(self, event: AstrMessageEvent) -> str:
+        return f"{self._directed_group_key(event)}:sender:{event.get_sender_id()}"
 
     async def _decide(self, event: AstrMessageEvent, text: str) -> tuple[str, str]:
         for pattern in self.skip_patterns:

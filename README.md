@@ -9,7 +9,8 @@
 - 支持普通群聊消息的智能主动回复：只有模型判断小昭此刻自然插话有帮助时才回复。
 - 自动读取 AstrBot 当前群聊上下文，辅助判断当前对话场景。
 - 对插件触发的回复追加系统提醒，让小昭自然回应，不解释触发机制，也不特意强调对方是不是主人。
-- 原生 `@机器人`、回复机器人消息等场景仍交给 AstrBot 默认流程处理。
+- 原生 `@机器人`、回复机器人消息等场景会先经过防刷屏冷却，再交给 AstrBot 默认流程处理。
+- 主人 ID 可在插件配置里自定义；仓库默认不写入任何真实用户 ID。
 
 ## 适用场景
 
@@ -70,6 +71,11 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 | `judge_timeout_sec` | int | `8` | 智能判定模型调用超时时间，单位秒。 |
 | `active_reply_enabled` | bool | `true` | 是否启用未被点名时的智能主动回复。 |
 | `active_reply_cooldown_sec` | int | `30` | 同一会话内主动回复冷却时间，避免连续抢话。 |
+| `directed_reply_guard_enabled` | bool | `true` | 是否启用原生 `@机器人`、回复机器人消息的防刷屏冷却。 |
+| `directed_reply_group_cooldown_sec` | int | `8` | 同一群聊内原生点名机器人的全局冷却时间。 |
+| `directed_reply_sender_cooldown_sec` | int | `60` | 同一群聊内同一发送者原生点名机器人的冷却时间。 |
+| `directed_reply_owner_bypass` | bool | `true` | 主人是否绕过原生点名防刷屏冷却。 |
+| `owner_ids` | list | `[]` | 主人用户 ID 列表。仓库默认留空，请在本机配置里填写真实平台用户 ID。 |
 | `mention_keywords` | list | `["小昭", "小昭猫娘"]` | 群聊提及时用于进入智能提及判断的关键词，可改成任意机器人昵称、别名或唤醒称呼。 |
 | `aliases` | list | `["小昭", "小昭猫娘"]` | 旧版兼容项；新配置请优先使用 `mention_keywords`。 |
 
@@ -79,6 +85,12 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 
 ```json
 "mention_keywords": ["赵小昭", "小赵", "bot"]
+```
+
+如果希望某些主人账号不受连续 `@机器人` 防刷屏冷却影响，可以配置：
+
+```json
+"owner_ids": ["<your_user_id>"]
 ```
 
 ## 回复策略
@@ -104,6 +116,17 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 - 同一会话还在冷却时间内。
 
 模型只在认为机器人自然插话有帮助时返回 `REPLY`。例如有人提出开放问题、求助、讨论卡住、需要总结或配置帮助。普通闲聊、短表情、刷屏、两人正在私下对话时应返回 `SKIP`。
+
+### 原生 @ 或回复机器人时
+
+当群聊消息原生 `@机器人`、`@全体` 或回复机器人消息时，插件会先检查防刷屏冷却：
+
+1. 如果 `directed_reply_guard_enabled=false`，不做限制。
+2. 如果发送者在 `owner_ids` 中且 `directed_reply_owner_bypass=true`，不做限制。
+3. 同一群聊在 `directed_reply_group_cooldown_sec` 秒内已经允许过一次原生点名回复时，后续点名会被静默拦截。
+4. 同一发送者在 `directed_reply_sender_cooldown_sec` 秒内已经允许过一次原生点名回复时，后续点名会被静默拦截。
+
+被拦截的消息不会进入模型调用，也不会让机器人每条都回复。
 
 ## 与小昭人设配合
 
@@ -147,6 +170,13 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 - 增大 `active_reply_cooldown_sec`。
 - 关闭 `active_reply_enabled`，只保留提及判断。
 - 确认 AstrBot 内置主动回复已关闭，避免重复机制。
+
+### 连续 @ 机器人仍然每条都回复
+
+- 确认 `directed_reply_guard_enabled=true`。
+- 增大 `directed_reply_group_cooldown_sec` 或 `directed_reply_sender_cooldown_sec`。
+- 确认刷屏账号没有被填进 `owner_ids`。
+- 修改配置后重启 AstrBot，或在插件管理里重新加载插件。
 
 ### 小昭完全不主动回复
 

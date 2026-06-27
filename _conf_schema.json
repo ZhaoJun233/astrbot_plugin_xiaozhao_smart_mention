@@ -19,6 +19,31 @@
     "type": "int",
     "default": 30
   },
+  "directed_reply_guard_enabled": {
+    "description": "启用原生 @/回复机器人的防刷屏冷却；开启后连续恶意 @ 不会每条都触发模型回复",
+    "type": "bool",
+    "default": true
+  },
+  "directed_reply_group_cooldown_sec": {
+    "description": "同一群聊内原生 @/回复机器人的全局冷却时间（秒）",
+    "type": "int",
+    "default": 8
+  },
+  "directed_reply_sender_cooldown_sec": {
+    "description": "同一群聊内同一发送者原生 @/回复机器人的冷却时间（秒）",
+    "type": "int",
+    "default": 60
+  },
+  "directed_reply_owner_bypass": {
+    "description": "主人是否绕过原生 @/回复机器人的防刷屏冷却",
+    "type": "bool",
+    "default": true
+  },
+  "owner_ids": {
+    "description": "主人用户 ID 列表；用于主人绕过防刷屏冷却。仓库默认留空，请在本机配置里填写自己的平台用户 ID",
+    "type": "list",
+    "default": []
+  },
   "mention_keywords": {
     "description": "群聊提到这些关键词时进入智能提及判断；可填写机器人昵称、别名或其他唤醒称呼",
     "type": "list",
