@@ -1,0 +1,8 @@
+name: astrbot_plugin_xiaozhao_smart_mention
+desc: 群聊提到小昭时，智能判断是否需要小昭自然回应
+short_desc: 小昭智能提及回复
+version: 0.2.0
+author: zhao
+repo: ""
+display_name: 小昭智能提及回复
+astrbot_version: ">=4.24.0"

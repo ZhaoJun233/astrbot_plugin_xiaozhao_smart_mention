@@ -1,0 +1,27 @@
+{
+  "use_llm_judge": {
+    "description": "规则无法明确判断时，调用当前模型判定是否回复",
+    "type": "bool",
+    "default": true
+  },
+  "judge_timeout_sec": {
+    "description": "智能判定模型调用超时时间（秒）",
+    "type": "int",
+    "default": 8
+  },
+  "active_reply_enabled": {
+    "description": "启用普通群聊的智能主动回复",
+    "type": "bool",
+    "default": true
+  },
+  "active_reply_cooldown_sec": {
+    "description": "智能主动回复冷却时间（秒），避免连续抢话",
+    "type": "int",
+    "default": 30
+  },
+  "aliases": {
+    "description": "触发别名列表",
+    "type": "list",
+    "default": ["小昭", "小昭猫娘"]
+  }
+}

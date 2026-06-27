@@ -1,0 +1,404 @@
+from __future__ import annotations
+
+import re
+import asyncio
+from collections.abc import AsyncGenerator, Iterable
+from time import monotonic
+
+from astrbot import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import At, AtAll, Image, Reply
+from astrbot.api.provider import ProviderRequest
+from astrbot.api.star import Context, Star
+from astrbot.core.config import AstrBotConfig
+from astrbot.core.platform.message_type import MessageType
+from astrbot.core.star.filter.custom_filter import CustomFilter
+
+
+PLUGIN_TAG = "[xiaozhao_smart_mention]"
+EXTRA_DECISION = "xiaozhao_smart_mention_decision"
+EXTRA_REASON = "xiaozhao_smart_mention_reason"
+EXTRA_MODE = "xiaozhao_smart_mention_mode"
+
+DEFAULT_ALIASES = ["小昭", "小昭猫娘"]
+RUNTIME_ALIASES = list(DEFAULT_ALIASES)
+DEFAULT_REPLY_PATTERNS = [
+    r"^(?:小昭|小昭猫娘)[,，!！?？\s]*(?:在吗|出来|来一下|帮|救|看|听|说|解释|告诉|回答|评价|分析|查|写|做|能|可以|是不是|为什么|怎么|咋|如何|吗|呢)",
+    r"(?:问|请|让|叫|喊)(?:一下)?(?:小昭|小昭猫娘)",
+    r"(?:小昭|小昭猫娘).*(?:吗|嘛|呢|么|？|\?|帮我|能不能|可不可以|要不要|怎么|如何|为什么|啥|什么|谁|哪里|哪儿|几点|多少)",
+]
+DEFAULT_SKIP_PATTERNS = [
+    r"(?:小昭|小昭猫娘).*(?:别回|不要回|不用回|别回复|不要回复|不用回复|别理|不用理|不要理)",
+]
+
+
+def _compile_patterns(patterns: Iterable[str]) -> list[re.Pattern[str]]:
+    return [re.compile(pattern, re.IGNORECASE) for pattern in patterns if pattern]
+
+
+def _as_list(value, fallback: list[str]) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return list(fallback)
+
+
+class MentionAliasFilter(CustomFilter):
+    def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
+        if event.get_message_type() != MessageType.GROUP_MESSAGE:
+            return False
+
+        text = event.get_message_str().strip()
+        if not text:
+            return False
+
+        return any(alias and alias in text for alias in RUNTIME_ALIASES)
+
+
+class Main(Star):
+    def __init__(self, context: Context, config=None) -> None:
+        super().__init__(context)
+        self.context = context
+        self.config = config or {}
+        global RUNTIME_ALIASES
+        self.use_llm_judge = bool(self.config.get("use_llm_judge", True))
+        self.judge_timeout_sec = float(self.config.get("judge_timeout_sec", 8))
+        self.active_reply_enabled = bool(self.config.get("active_reply_enabled", True))
+        self.active_reply_cooldown_sec = float(
+            self.config.get("active_reply_cooldown_sec", 30),
+        )
+        self.aliases = _as_list(self.config.get("aliases"), DEFAULT_ALIASES)
+        RUNTIME_ALIASES = list(self.aliases)
+        self.reply_patterns = _compile_patterns(
+            _as_list(self.config.get("reply_patterns"), DEFAULT_REPLY_PATTERNS),
+        )
+        self.skip_patterns = _compile_patterns(
+            _as_list(self.config.get("skip_patterns"), DEFAULT_SKIP_PATTERNS),
+        )
+        self._last_active_reply_at: dict[str, float] = {}
+
+    async def initialize(self) -> None:
+        logger.info(
+            "%s loaded: aliases=%s, use_llm_judge=%s, active_reply_enabled=%s",
+            PLUGIN_TAG,
+            ",".join(self.aliases),
+            self.use_llm_judge,
+            self.active_reply_enabled,
+        )
+
+    @filter.custom_filter(MentionAliasFilter, priority=20)
+    async def smart_mention(self, event: AstrMessageEvent) -> None:
+        if event.is_at_or_wake_command or self._has_native_directed_signal(event):
+            return
+
+        text = event.get_message_str().strip()
+        if not text:
+            event.stop_event()
+            return
+
+        decision, reason = await self._decide(event, text)
+        event.set_extra(EXTRA_DECISION, decision)
+        event.set_extra(EXTRA_REASON, reason)
+        event.set_extra(EXTRA_MODE, "mention")
+
+        if decision == "REPLY":
+            event.is_wake = True
+            event.is_at_or_wake_command = True
+            logger.info(
+                "%s reply: group=%s sender=%s reason=%s text=%s",
+                PLUGIN_TAG,
+                event.get_group_id(),
+                event.get_sender_id(),
+                reason,
+                _clip(text),
+            )
+            return
+
+        logger.info(
+            "%s skip: group=%s sender=%s reason=%s text=%s",
+            PLUGIN_TAG,
+            event.get_group_id(),
+            event.get_sender_id(),
+            reason,
+            _clip(text),
+        )
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=-20)
+    async def smart_active_reply(
+        self,
+        event: AstrMessageEvent,
+    ) -> AsyncGenerator[ProviderRequest | None, None]:
+        """普通群聊消息的智能主动回复。
+
+        该 handler 不直接把所有群消息变成默认 LLM 请求；只有智能判定为 REPLY 时
+        才 yield ProviderRequest，让 AstrBot 用当前小昭人格生成主动回复。
+        """
+        if not self.active_reply_enabled:
+            return
+        if event.is_at_or_wake_command or self._has_native_directed_signal(event):
+            return
+        if event.get_extra(EXTRA_DECISION):
+            return
+        if self._is_self_message(event):
+            return
+
+        text = event.get_message_str().strip()
+        if not text:
+            return
+        if any(alias and alias in text for alias in self.aliases):
+            return
+
+        cooldown_key = event.unified_msg_origin
+        elapsed = monotonic() - self._last_active_reply_at.get(cooldown_key, 0)
+        if elapsed < self.active_reply_cooldown_sec:
+            logger.debug(
+                "%s active skip: cooldown %.1fs/%.1fs",
+                PLUGIN_TAG,
+                elapsed,
+                self.active_reply_cooldown_sec,
+            )
+            return
+
+        decision = await self._active_decide(event, text)
+        if decision != "REPLY":
+            logger.debug(
+                "%s active skip: group=%s sender=%s text=%s",
+                PLUGIN_TAG,
+                event.get_group_id(),
+                event.get_sender_id(),
+                _clip(text),
+            )
+            return
+
+        conversation = await self._get_or_create_conversation(event)
+        if conversation is None:
+            return
+
+        event.set_extra(EXTRA_DECISION, "REPLY")
+        event.set_extra(EXTRA_REASON, "active_llm_judge")
+        event.set_extra(EXTRA_MODE, "active_reply")
+        self._last_active_reply_at[cooldown_key] = monotonic()
+
+        logger.info(
+            "%s active reply: group=%s sender=%s text=%s",
+            PLUGIN_TAG,
+            event.get_group_id(),
+            event.get_sender_id(),
+            _clip(text),
+        )
+
+        yield event.request_llm(
+            prompt=text,
+            session_id=event.session_id,
+            image_urls=await self._collect_image_urls(event),
+            conversation=conversation,
+        )
+        event.stop_event()
+
+    @filter.on_llm_request(priority=80)
+    async def decorate_llm_request(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+    ) -> None:
+        if event.get_extra(EXTRA_DECISION) != "REPLY":
+            return
+
+        sender_name = event.get_sender_name() or "未知昵称"
+        sender_id = event.get_sender_id() or "未知ID"
+        reason = event.get_extra(EXTRA_REASON, "smart_mention")
+        mode = event.get_extra(EXTRA_MODE, "mention")
+        trigger = "群聊智能主动回复" if mode == "active_reply" else "群聊提到小昭"
+        note = (
+            "<system_reminder>"
+            f"本轮消息触发方式: {trigger}。"
+            f"判断原因: {reason}。"
+            f"当前发言人昵称/ID: {sender_name}/{sender_id}。"
+            "请自然回应当前场景；"
+            "不要解释触发机制，不要特意强调对方是不是主人。"
+            "</system_reminder>"
+        )
+        req.system_prompt = (req.system_prompt or "") + "\n" + note
+
+    def _has_native_directed_signal(self, event: AstrMessageEvent) -> bool:
+        self_id = str(event.get_self_id())
+        for comp in event.get_messages():
+            if isinstance(comp, At) and str(comp.qq) in (self_id, "all"):
+                return True
+            if isinstance(comp, AtAll):
+                return True
+            if isinstance(comp, Reply) and str(getattr(comp, "sender_id", "")) == self_id:
+                return True
+        return False
+
+    def _is_self_message(self, event: AstrMessageEvent) -> bool:
+        return bool(event.get_self_id()) and str(event.get_sender_id()) == str(
+            event.get_self_id(),
+        )
+
+    async def _decide(self, event: AstrMessageEvent, text: str) -> tuple[str, str]:
+        for pattern in self.skip_patterns:
+            if pattern.search(text):
+                return "SKIP", f"skip_pattern:{pattern.pattern}"
+
+        for pattern in self.reply_patterns:
+            if pattern.search(text):
+                return "REPLY", f"reply_pattern:{pattern.pattern}"
+
+        if not self.use_llm_judge:
+            return "SKIP", "llm_judge_disabled"
+
+        llm_decision = await self._llm_decide(event, text)
+        if llm_decision in {"REPLY", "SKIP"}:
+            return llm_decision, "llm_judge"
+
+        return "SKIP", "llm_judge_unavailable"
+
+    async def _llm_decide(self, event: AstrMessageEvent, text: str) -> str | None:
+        provider = self.context.get_using_provider(event.unified_msg_origin)
+        if not provider:
+            return None
+
+        recent_context = self._recent_group_context(event)
+        context_block = (
+            f"最近群聊上下文:\n{recent_context}\n\n" if recent_context else ""
+        )
+        prompt = (
+            "你是群聊机器人“小昭”的回复触发判定器。"
+            "请判断当前群聊消息虽然提到了“小昭”，是否需要小昭回复。\n"
+            "只在以下情况输出 REPLY：用户直接叫小昭、向小昭提问、请求小昭帮忙、需要小昭澄清或回应。\n"
+            "以下情况输出 SKIP：只是旁观讨论、复述/评价小昭之前的话、开玩笑但没有让小昭接话、明确说不用回复。\n"
+            "只能输出 REPLY 或 SKIP，不要输出其他内容。\n\n"
+            f"群号: {event.get_group_id()}\n"
+            f"发言人ID: {event.get_sender_id()}\n"
+            f"发言人昵称: {event.get_sender_name()}\n"
+            f"{context_block}"
+            f"消息: {text}\n"
+        )
+
+        try:
+            resp = await asyncio.wait_for(
+                provider.text_chat(
+                    prompt=prompt,
+                    system_prompt="你只输出 REPLY 或 SKIP。",
+                    contexts=[],
+                    request_max_retries=1,
+                ),
+                timeout=self.judge_timeout_sec,
+            )
+        except Exception as exc:
+            logger.warning("%s llm judge failed: %s", PLUGIN_TAG, exc)
+            return None
+
+        answer = (getattr(resp, "completion_text", "") or "").strip().upper()
+        if "REPLY" in answer and "SKIP" not in answer:
+            return "REPLY"
+        if "SKIP" in answer and "REPLY" not in answer:
+            return "SKIP"
+        return None
+
+    async def _active_decide(self, event: AstrMessageEvent, text: str) -> str | None:
+        provider = self.context.get_using_provider(event.unified_msg_origin)
+        if not provider:
+            return None
+
+        recent_context = self._recent_group_context(event)
+        context_block = (
+            f"最近群聊上下文:\n{recent_context}\n\n" if recent_context else ""
+        )
+        prompt = (
+            "你是群聊机器人“小昭”的主动回复判定器。"
+            "请判断小昭是否应该在没有被点名、没有被@的情况下主动接一句话。\n"
+            "只在以下情况输出 REPLY：群里有人提出开放问题或求助、讨论明显卡住、"
+            "有人需要解释/总结/配置帮助、有人邀请大家发表看法、当前话题非常适合小昭自然补充。\n"
+            "以下情况输出 SKIP：普通闲聊、短表情/口头禅、广告或刷屏、两个人正在互相对话、"
+            "只是陈述近况、接话会显得突兀、刚刚已经主动回复过类似话题。\n"
+            "要求：宁可少回，不要抢话；只有你认为小昭此刻自然插话会有帮助才 REPLY。\n"
+            "只能输出 REPLY 或 SKIP，不要输出其他内容。\n\n"
+            f"群号: {event.get_group_id()}\n"
+            f"发言人ID: {event.get_sender_id()}\n"
+            f"发言人昵称: {event.get_sender_name()}\n"
+            f"{context_block}"
+            f"当前消息: {text}\n"
+        )
+
+        try:
+            resp = await asyncio.wait_for(
+                provider.text_chat(
+                    prompt=prompt,
+                    system_prompt="你只输出 REPLY 或 SKIP。",
+                    contexts=[],
+                    request_max_retries=1,
+                ),
+                timeout=self.judge_timeout_sec,
+            )
+        except Exception as exc:
+            logger.warning("%s active judge failed: %s", PLUGIN_TAG, exc)
+            return None
+
+        answer = (getattr(resp, "completion_text", "") or "").strip().upper()
+        if "REPLY" in answer and "SKIP" not in answer:
+            return "REPLY"
+        if "SKIP" in answer and "REPLY" not in answer:
+            return "SKIP"
+        return None
+
+    async def _get_or_create_conversation(self, event: AstrMessageEvent):
+        umo = event.unified_msg_origin
+        try:
+            cid = await self.context.conversation_manager.get_curr_conversation_id(umo)
+            if not cid:
+                cid = await self.context.conversation_manager.new_conversation(
+                    umo,
+                    event.get_platform_id(),
+                )
+            conversation = await self.context.conversation_manager.get_conversation(
+                umo,
+                cid,
+            )
+            if conversation is None:
+                cid = await self.context.conversation_manager.new_conversation(
+                    umo,
+                    event.get_platform_id(),
+                )
+                conversation = await self.context.conversation_manager.get_conversation(
+                    umo,
+                    cid,
+                )
+            return conversation
+        except Exception as exc:
+            logger.warning("%s create conversation failed: %s", PLUGIN_TAG, exc)
+            return None
+
+    async def _collect_image_urls(self, event: AstrMessageEvent) -> list[str]:
+        image_urls: list[str] = []
+        for comp in event.get_messages():
+            if not isinstance(comp, Image):
+                continue
+            try:
+                image_urls.append(await comp.convert_to_file_path())
+            except Exception as exc:
+                logger.warning("%s image convert failed: %s", PLUGIN_TAG, exc)
+        return image_urls
+
+    def _recent_group_context(self, event: AstrMessageEvent, limit: int = 8) -> str:
+        try:
+            metadata = self.context.get_registered_star("astrbot")
+            star_cls = getattr(metadata, "star_cls", None) if metadata else None
+            group_chat_context = getattr(star_cls, "group_chat_context", None)
+            raw_records = getattr(group_chat_context, "raw_records", {})
+            records = raw_records.get(event.unified_msg_origin)
+            if not records:
+                return ""
+            return "\n".join(list(records)[-limit:])
+        except Exception as exc:
+            logger.debug("%s read group context failed: %s", PLUGIN_TAG, exc)
+            return ""
+
+
+def _clip(text: str, limit: int = 120) -> str:
+    text = text.replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
