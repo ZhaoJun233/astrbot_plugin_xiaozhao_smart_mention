@@ -4,6 +4,8 @@ import asyncio
 import unittest
 from time import monotonic
 
+from astrbot.core.agent.tool import FunctionTool, ToolSet
+from astrbot.core.provider.entities import ProviderRequest
 from main import EXTRA_DECISION, EXTRA_REASON, Main, _format_exception, _stop_event_silently
 
 
@@ -242,6 +244,32 @@ class DirectedReplyGuardTest(unittest.TestCase):
 
         self.assertEqual(items, [])
         self.assertEqual(len(plugin._last_active_judge_attempt_at), 1)
+
+    def test_smart_reply_removes_direct_send_tool_from_llm_request(self) -> None:
+        plugin = build_plugin({"mention_keywords": ["小昭"]})
+        event = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭，测试")
+        event.set_extra(EXTRA_DECISION, "REPLY")
+        request = ProviderRequest(
+            func_tool=ToolSet(
+                [
+                    FunctionTool(
+                        name="send_message_to_user",
+                        description="direct send",
+                        parameters={"type": "object", "properties": {}},
+                    ),
+                    FunctionTool(
+                        name="keep_this_tool",
+                        description="other tool",
+                        parameters={"type": "object", "properties": {}},
+                    ),
+                ],
+            ),
+        )
+
+        asyncio.run(plugin.decorate_llm_request(event, request))
+
+        self.assertIsNotNone(request.func_tool)
+        self.assertEqual(request.func_tool.names(), ["keep_this_tool"])
 
     def test_empty_exception_name_is_logged(self) -> None:
         self.assertEqual(_format_exception(TimeoutError()), "TimeoutError")

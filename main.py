@@ -381,6 +381,8 @@ class Main(Star):
         if event.get_extra(EXTRA_DECISION) != "REPLY":
             return
 
+        self._remove_direct_send_tool(req)
+
         sender_name = event.get_sender_name() or "未知昵称"
         sender_id = event.get_sender_id() or "未知ID"
         reason = event.get_extra(EXTRA_REASON, "smart_mention")
@@ -400,6 +402,11 @@ class Main(Star):
             "</system_reminder>"
         )
         req.system_prompt = (req.system_prompt or "") + "\n" + note
+
+    def _remove_direct_send_tool(self, req: ProviderRequest) -> None:
+        if req.func_tool is None:
+            return
+        req.func_tool.remove_tool("send_message_to_user")
 
     def _has_native_directed_signal(self, event: AstrMessageEvent) -> bool:
         self_id = str(event.get_self_id())
