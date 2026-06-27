@@ -71,6 +71,8 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 | `judge_timeout_sec` | int | `8` | 智能判定模型调用超时时间，单位秒。 |
 | `active_reply_enabled` | bool | `true` | 是否启用未被点名时的智能主动回复。 |
 | `active_reply_cooldown_sec` | int | `30` | 同一会话内主动回复冷却时间，避免连续抢话。 |
+| `active_judge_attempt_cooldown_sec` | int | `45` | 主动回复判定尝试冷却时间；无论最后是否回复，都避免每条普通消息都请求模型判定。 |
+| `judge_failure_backoff_sec` | int | `120` | 智能判定模型超时、429 或其他失败后的熔断时间；熔断期间跳过智能判定。 |
 | `directed_reply_guard_enabled` | bool | `true` | 是否启用原生 `@机器人`、回复机器人消息的防刷屏冷却。 |
 | `directed_reply_group_cooldown_sec` | int | `8` | 同一群聊内原生点名机器人的全局冷却时间。 |
 | `directed_reply_sender_cooldown_sec` | int | `60` | 同一群聊内同一发送者原生点名机器人的冷却时间。 |
@@ -114,6 +116,8 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 - 消息为空。
 - 消息已经提到了配置关键词，避免和“提及判断”重复。
 - 同一会话还在冷却时间内。
+- 同一会话还在主动判定尝试冷却时间内。
+- 最近一次智能判定超时、429 或失败后仍在熔断时间内。
 
 模型只在认为机器人自然插话有帮助时返回 `REPLY`。例如有人提出开放问题、求助、讨论卡住、需要总结或配置帮助。普通闲聊、短表情、刷屏、两人正在私下对话时应返回 `SKIP`。
 
@@ -168,8 +172,15 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 ### 小昭主动回复太频繁
 
 - 增大 `active_reply_cooldown_sec`。
+- 增大 `active_judge_attempt_cooldown_sec`，减少普通消息触发判定模型的频率。
 - 关闭 `active_reply_enabled`，只保留提及判断。
 - 确认 AstrBot 内置主动回复已关闭，避免重复机制。
+
+### 出现 429 或 active judge failed
+
+- `429 Too many requests` 表示当前 provider 限流；插件会在 `judge_failure_backoff_sec` 秒内跳过后续智能判定。
+- `active judge failed: TimeoutError` 表示主动回复判定超时；插件同样会进入短暂熔断。
+- 如果仍然频繁出现，增大 `active_judge_attempt_cooldown_sec` 或暂时关闭 `active_reply_enabled`。
 
 ### 连续 @ 机器人仍然每条都回复
 

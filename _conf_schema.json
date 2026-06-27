@@ -19,6 +19,16 @@
     "type": "int",
     "default": 30
   },
+  "active_judge_attempt_cooldown_sec": {
+    "description": "普通群聊主动回复判定的尝试冷却时间（秒）；无论判定结果是否回复，都会避免频繁请求模型",
+    "type": "int",
+    "default": 45
+  },
+  "judge_failure_backoff_sec": {
+    "description": "智能判定模型超时、429 或其他失败后的熔断时间（秒）；熔断期间跳过智能判定，避免继续打爆 provider",
+    "type": "int",
+    "default": 120
+  },
   "directed_reply_guard_enabled": {
     "description": "启用原生 @/回复机器人的防刷屏冷却；开启后连续恶意 @ 不会每条都触发模型回复",
     "type": "bool",

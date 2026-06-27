@@ -138,6 +138,14 @@ class Main(Star):
         self.active_reply_cooldown_sec = float(
             self.config.get("active_reply_cooldown_sec", 30),
         )
+        self.active_judge_attempt_cooldown_sec = _as_float(
+            self.config.get("active_judge_attempt_cooldown_sec"),
+            45,
+        )
+        self.judge_failure_backoff_sec = _as_float(
+            self.config.get("judge_failure_backoff_sec"),
+            120,
+        )
         self.directed_reply_guard_enabled = bool(
             self.config.get("directed_reply_guard_enabled", True),
         )
@@ -167,6 +175,8 @@ class Main(Star):
             self.mention_keywords,
         )
         self._last_active_reply_at: dict[str, float] = {}
+        self._last_active_judge_attempt_at: dict[str, float] = {}
+        self._judge_backoff_until: dict[str, float] = {}
         self._last_directed_group_at: dict[str, float] = {}
         self._last_directed_sender_at: dict[str, float] = {}
 
@@ -207,7 +217,7 @@ class Main(Star):
             reason,
             _clip(text),
         )
-        event.stop_event()
+        _stop_event_silently(event)
 
     @filter.custom_filter(MentionAliasFilter, priority=20)
     async def smart_mention(self, event: AstrMessageEvent) -> None:
@@ -216,7 +226,7 @@ class Main(Star):
 
         text = event.get_message_str().strip()
         if not text:
-            event.stop_event()
+            _stop_event_silently(event)
             return
 
         decision, reason = await self._decide(event, text)
@@ -282,6 +292,16 @@ class Main(Star):
             )
             return
 
+        backing_off, reason = self._is_judge_backoff_active(event)
+        if backing_off:
+            logger.debug("%s active skip: %s", PLUGIN_TAG, reason)
+            return
+
+        allowed, reason = self._consume_active_judge_attempt_slot(event)
+        if not allowed:
+            logger.debug("%s active skip: %s", PLUGIN_TAG, reason)
+            return
+
         decision = await self._active_decide(event, text)
         if decision != "REPLY":
             logger.debug(
@@ -316,7 +336,7 @@ class Main(Star):
             image_urls=await self._collect_image_urls(event),
             conversation=conversation,
         )
-        event.stop_event()
+        _stop_event_silently(event)
 
     @filter.on_llm_request(priority=80)
     async def decorate_llm_request(
@@ -406,6 +426,67 @@ class Main(Star):
     def _directed_sender_key(self, event: AstrMessageEvent) -> str:
         return f"{self._directed_group_key(event)}:sender:{event.get_sender_id()}"
 
+    def _is_judge_backoff_active(
+        self,
+        event: AstrMessageEvent,
+        *,
+        now: float | None = None,
+    ) -> tuple[bool, str]:
+        now = monotonic() if now is None else now
+        key = self._judge_backoff_key(event)
+        until = self._judge_backoff_until.get(key, 0)
+        if now < until:
+            return True, f"judge_backoff:{until - now:.1f}s"
+        return False, "allowed"
+
+    def _record_judge_failure(
+        self,
+        event: AstrMessageEvent,
+        mode: str,
+        exc: BaseException,
+        *,
+        now: float | None = None,
+    ) -> None:
+        if self.judge_failure_backoff_sec <= 0:
+            return
+        now = monotonic() if now is None else now
+        key = self._judge_backoff_key(event)
+        self._judge_backoff_until[key] = now + self.judge_failure_backoff_sec
+        logger.debug(
+            "%s %s judge backoff %.1fs after %s",
+            PLUGIN_TAG,
+            mode,
+            self.judge_failure_backoff_sec,
+            _format_exception(exc),
+        )
+
+    def _consume_active_judge_attempt_slot(
+        self,
+        event: AstrMessageEvent,
+        *,
+        now: float | None = None,
+    ) -> tuple[bool, str]:
+        now = monotonic() if now is None else now
+        key = self._active_judge_attempt_key(event)
+        elapsed = now - self._last_active_judge_attempt_at.get(key, 0)
+        if (
+            self.active_judge_attempt_cooldown_sec > 0
+            and elapsed < self.active_judge_attempt_cooldown_sec
+        ):
+            return (
+                False,
+                f"active_judge_attempt_cooldown:{elapsed:.1f}/{self.active_judge_attempt_cooldown_sec:.1f}s",
+            )
+
+        self._last_active_judge_attempt_at[key] = now
+        return True, "allowed"
+
+    def _judge_backoff_key(self, event: AstrMessageEvent) -> str:
+        return f"{event.unified_msg_origin}:bot:{event.get_self_id()}"
+
+    def _active_judge_attempt_key(self, event: AstrMessageEvent) -> str:
+        return self._judge_backoff_key(event)
+
     async def _decide(self, event: AstrMessageEvent, text: str) -> tuple[str, str]:
         for pattern in self.skip_patterns:
             if pattern.search(text):
@@ -417,6 +498,10 @@ class Main(Star):
 
         if not self.use_llm_judge:
             return "SKIP", "llm_judge_disabled"
+
+        backing_off, reason = self._is_judge_backoff_active(event)
+        if backing_off:
+            return "SKIP", reason
 
         llm_decision = await self._llm_decide(event, text)
         if llm_decision in {"REPLY", "SKIP"}:
@@ -459,7 +544,12 @@ class Main(Star):
                 timeout=self.judge_timeout_sec,
             )
         except Exception as exc:
-            logger.warning("%s llm judge failed: %s", PLUGIN_TAG, exc)
+            self._record_judge_failure(event, "llm", exc)
+            logger.warning(
+                "%s llm judge failed: %s",
+                PLUGIN_TAG,
+                _format_exception(exc),
+            )
             return None
 
         answer = (getattr(resp, "completion_text", "") or "").strip().upper()
@@ -506,7 +596,12 @@ class Main(Star):
                 timeout=self.judge_timeout_sec,
             )
         except Exception as exc:
-            logger.warning("%s active judge failed: %s", PLUGIN_TAG, exc)
+            self._record_judge_failure(event, "active", exc)
+            logger.warning(
+                "%s active judge failed: %s",
+                PLUGIN_TAG,
+                _format_exception(exc),
+            )
             return None
 
         answer = (getattr(resp, "completion_text", "") or "").strip().upper()
@@ -583,3 +678,17 @@ def _clip(text: str, limit: int = 120) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "..."
+
+
+def _format_exception(exc: BaseException) -> str:
+    message = str(exc).strip()
+    if message:
+        return message
+    return exc.__class__.__name__
+
+
+def _stop_event_silently(event: AstrMessageEvent) -> None:
+    if hasattr(event, "_force_stopped"):
+        event._force_stopped = True
+        return
+    event.stop_event()
