@@ -71,12 +71,12 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 | `judge_timeout_sec` | int | `8` | 智能判定模型调用超时时间，单位秒。 |
 | `active_reply_enabled` | bool | `true` | 是否启用未被点名时的智能主动回复。 |
 | `active_reply_cooldown_sec` | int | `30` | 同一会话内主动回复冷却时间，避免连续抢话。 |
-| `active_judge_attempt_cooldown_sec` | int | `45` | 主动回复判定尝试冷却时间；无论最后是否回复，都避免每条普通消息都请求模型判定。 |
-| `judge_failure_backoff_sec` | int | `120` | 智能判定模型超时、429 或其他失败后的熔断时间；熔断期间跳过智能判定。 |
-| `directed_reply_guard_enabled` | bool | `true` | 是否启用原生 `@机器人`、回复机器人消息的防刷屏冷却。 |
-| `directed_reply_group_cooldown_sec` | int | `8` | 同一群聊内原生点名机器人的全局冷却时间。 |
-| `directed_reply_sender_cooldown_sec` | int | `60` | 同一群聊内同一发送者原生点名机器人的冷却时间。 |
-| `directed_reply_owner_bypass` | bool | `true` | 主人是否绕过原生点名防刷屏冷却。 |
+| `active_judge_attempt_cooldown_sec` | int | `45` | 无关键词主动回复判定尝试冷却时间；无论最后是否回复，都避免每条普通消息都请求模型判定。 |
+| `judge_failure_backoff_sec` | int | `120` | 智能判定模型超时、429 或其他失败后的熔断时间；熔断期间跳过智能判定，但不会拦截明确的规则点名回复。 |
+| `directed_reply_guard_enabled` | bool | `true` | 是否启用原生 `@机器人`、回复机器人消息、文字点名机器人的防刷屏冷却。 |
+| `directed_reply_group_cooldown_sec` | int | `8` | 同一群聊内点名机器人的全局冷却时间。 |
+| `directed_reply_sender_cooldown_sec` | int | `60` | 同一群聊内同一发送者点名机器人的冷却时间。 |
+| `directed_reply_owner_bypass` | bool | `true` | 主人是否绕过点名防刷屏冷却。 |
 | `owner_ids` | list | `[]` | 主人用户 ID 列表。仓库默认留空，请在本机配置里填写真实平台用户 ID。 |
 | `mention_keywords` | list | `["小昭", "小昭猫娘"]` | 群聊提及时用于进入智能提及判断的关键词，可改成任意机器人昵称、别名或唤醒称呼。 |
 | `aliases` | list | `["小昭", "小昭猫娘"]` | 旧版兼容项；新配置请优先使用 `mention_keywords`。 |
@@ -118,17 +118,18 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 - 同一会话还在冷却时间内。
 - 同一会话还在主动判定尝试冷却时间内。
 - 最近一次智能判定超时、429 或失败后仍在熔断时间内。
+- 当前消息不像提问、求助、配置讨论或需要补充意见的场景。
 
 模型只在认为机器人自然插话有帮助时返回 `REPLY`。例如有人提出开放问题、求助、讨论卡住、需要总结或配置帮助。普通闲聊、短表情、刷屏、两人正在私下对话时应返回 `SKIP`。
 
-### 原生 @ 或回复机器人时
+### 点名机器人时
 
-当群聊消息原生 `@机器人`、`@全体` 或回复机器人消息时，插件会先检查防刷屏冷却：
+当群聊消息原生 `@机器人`、`@全体`、回复机器人消息，或文字里明确点名触发关键词并提问/求助时，插件会先检查防刷屏冷却：
 
 1. 如果 `directed_reply_guard_enabled=false`，不做限制。
 2. 如果发送者在 `owner_ids` 中且 `directed_reply_owner_bypass=true`，不做限制。
-3. 同一群聊在 `directed_reply_group_cooldown_sec` 秒内已经允许过一次原生点名回复时，后续点名会被静默拦截。
-4. 同一发送者在 `directed_reply_sender_cooldown_sec` 秒内已经允许过一次原生点名回复时，后续点名会被静默拦截。
+3. 同一群聊在 `directed_reply_group_cooldown_sec` 秒内已经允许过一次点名回复时，后续点名会被静默拦截。
+4. 同一发送者在 `directed_reply_sender_cooldown_sec` 秒内已经允许过一次点名回复时，后续点名会被静默拦截。
 
 被拦截的消息不会进入模型调用，也不会让机器人每条都回复。
 

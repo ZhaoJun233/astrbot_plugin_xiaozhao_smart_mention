@@ -24,12 +24,19 @@ DEFAULT_MENTION_KEYWORDS = ["小昭", "小昭猫娘"]
 DEFAULT_ALIASES = DEFAULT_MENTION_KEYWORDS
 RUNTIME_ALIASES = list(DEFAULT_MENTION_KEYWORDS)
 DEFAULT_REPLY_PATTERNS = [
-    r"^(?:{keywords})[,，!！?？\s]*(?:在吗|出来|来一下|帮|救|看|听|说|解释|告诉|回答|评价|分析|查|写|做|能|可以|是不是|为什么|怎么|咋|如何|吗|呢)",
+    r"^(?:{keywords})[,，!！?？\s]*(?:你|妳|您)?(?:在吗|出来|来一下|觉得|认为|看|怎么看|咋看|说说|聊聊|帮|救|听|说|解释|告诉|回答|评价|锐评|分析|查|写|做|能|可以|是不是|为什么|怎么|咋|如何|吗|呢)",
     r"(?:问|请|让|叫|喊)(?:一下)?(?:{keywords})",
-    r"(?:{keywords}).*(?:吗|嘛|呢|么|？|\?|帮我|能不能|可不可以|要不要|怎么|如何|为什么|啥|什么|谁|哪里|哪儿|几点|多少)",
+    r"(?:{keywords}).*(?:吗|嘛|呢|么|？|\?|你觉得|你看|怎么看|咋看|说说|聊聊|评价|锐评|帮我|帮忙|能不能|可不可以|要不要|怎么|如何|为什么|啥|什么|谁|哪里|哪儿|几点|多少)",
 ]
 DEFAULT_SKIP_PATTERNS = [
     r"(?:{keywords}).*(?:别回|不要回|不用回|别回复|不要回复|不用回复|别理|不用理|不要理)",
+]
+DEFAULT_ACTIVE_REPLY_CUE_PATTERNS = [
+    r"[?？]",
+    r"(?:怎么|咋|如何|为什么|为啥|啥|什么|谁|哪里|哪儿|哪个|多少|几点|几|怎么办|咋办)",
+    r"(?:能不能|可不可以|有没有|要不要|求助|帮忙|帮我|救命|不会|不懂|卡住|报错|没反应|不回复|没回复)",
+    r"(?:配置|设置|插件|模型|机器人|provider|token|冷却|限流|429)",
+    r"(?:看法|意见|建议|分析一下|解释一下|总结一下)",
 ]
 
 
@@ -174,6 +181,12 @@ class Main(Star):
             _as_list(self.config.get("skip_patterns"), DEFAULT_SKIP_PATTERNS),
             self.mention_keywords,
         )
+        self.active_reply_cue_patterns = _compile_patterns(
+            _as_list(
+                self.config.get("active_reply_cue_patterns"),
+                DEFAULT_ACTIVE_REPLY_CUE_PATTERNS,
+            ),
+        )
         self._last_active_reply_at: dict[str, float] = {}
         self._last_active_judge_attempt_at: dict[str, float] = {}
         self._judge_backoff_until: dict[str, float] = {}
@@ -230,11 +243,26 @@ class Main(Star):
             return
 
         decision, reason = await self._decide(event, text)
-        event.set_extra(EXTRA_DECISION, decision)
-        event.set_extra(EXTRA_REASON, reason)
-        event.set_extra(EXTRA_MODE, "mention")
 
         if decision == "REPLY":
+            allowed, guard_reason = self._consume_keyword_reply_slot(event)
+            if not allowed:
+                event.set_extra(EXTRA_DECISION, "SKIP")
+                event.set_extra(EXTRA_REASON, guard_reason)
+                event.set_extra(EXTRA_MODE, "mention_guard")
+                logger.info(
+                    "%s skip: group=%s sender=%s reason=%s text=%s",
+                    PLUGIN_TAG,
+                    event.get_group_id(),
+                    event.get_sender_id(),
+                    guard_reason,
+                    _clip(text),
+                )
+                return
+
+            event.set_extra(EXTRA_DECISION, decision)
+            event.set_extra(EXTRA_REASON, reason)
+            event.set_extra(EXTRA_MODE, "mention")
             event.is_wake = True
             event.is_at_or_wake_command = True
             logger.info(
@@ -247,6 +275,9 @@ class Main(Star):
             )
             return
 
+        event.set_extra(EXTRA_DECISION, decision)
+        event.set_extra(EXTRA_REASON, reason)
+        event.set_extra(EXTRA_MODE, "mention")
         logger.info(
             "%s skip: group=%s sender=%s reason=%s text=%s",
             PLUGIN_TAG,
@@ -279,6 +310,9 @@ class Main(Star):
         if not text:
             return
         if _contains_keyword(text, self.mention_keywords):
+            return
+        if not self._has_active_reply_cue(text):
+            logger.debug("%s active skip: no_active_reply_cue", PLUGIN_TAG)
             return
 
         cooldown_key = event.unified_msg_origin
@@ -420,6 +454,16 @@ class Main(Star):
         self._last_directed_sender_at[sender_key] = now
         return True, "allowed"
 
+    def _consume_keyword_reply_slot(
+        self,
+        event: AstrMessageEvent,
+    ) -> tuple[bool, str]:
+        if not self.directed_reply_guard_enabled:
+            return True, "allowed"
+        if self.directed_reply_owner_bypass and self._is_owner_message(event):
+            return True, "owner_bypass"
+        return self._consume_directed_reply_slot(event)
+
     def _directed_group_key(self, event: AstrMessageEvent) -> str:
         return f"{event.unified_msg_origin}:bot:{event.get_self_id()}"
 
@@ -486,6 +530,9 @@ class Main(Star):
 
     def _active_judge_attempt_key(self, event: AstrMessageEvent) -> str:
         return self._judge_backoff_key(event)
+
+    def _has_active_reply_cue(self, text: str) -> bool:
+        return any(pattern.search(text) for pattern in self.active_reply_cue_patterns)
 
     async def _decide(self, event: AstrMessageEvent, text: str) -> tuple[str, str]:
         for pattern in self.skip_patterns:

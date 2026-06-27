@@ -1,66 +1,79 @@
 {
   "use_llm_judge": {
-    "description": "规则无法明确判断时，调用当前模型判定是否回复",
+    "description": "LLM 提及判定",
+    "hint": "规则无法明确判断时，调用当前模型判定是否回复。",
     "type": "bool",
     "default": true
   },
   "judge_timeout_sec": {
-    "description": "智能判定模型调用超时时间（秒）",
+    "description": "判定超时（秒）",
+    "hint": "智能判定模型单次调用的超时时间。",
     "type": "int",
     "default": 8
   },
   "active_reply_enabled": {
-    "description": "启用普通群聊的智能主动回复",
+    "description": "主动回复",
+    "hint": "启用普通群聊中未被点名时的智能主动回复。",
     "type": "bool",
     "default": true
   },
   "active_reply_cooldown_sec": {
-    "description": "智能主动回复冷却时间（秒），避免连续抢话",
+    "description": "主动回复冷却（秒）",
+    "hint": "同一会话内机器人主动回复后的冷却时间，避免连续抢话。",
     "type": "int",
     "default": 30
   },
   "active_judge_attempt_cooldown_sec": {
-    "description": "普通群聊主动回复判定的尝试冷却时间（秒）；无论判定结果是否回复，都会避免频繁请求模型",
+    "description": "主动判定间隔（秒）",
+    "hint": "无关键词普通群聊消息进入主动回复判定的最短间隔；无论最终是否回复，都会避免频繁请求模型。",
     "type": "int",
     "default": 45
   },
   "judge_failure_backoff_sec": {
-    "description": "智能判定模型超时、429 或其他失败后的熔断时间（秒）；熔断期间跳过智能判定，避免继续打爆 provider",
+    "description": "判定失败退避（秒）",
+    "hint": "智能判定模型超时、429 或其他失败后的暂停时间；暂停期间跳过智能判定，避免继续打爆 provider。",
     "type": "int",
     "default": 120
   },
   "directed_reply_guard_enabled": {
-    "description": "启用原生 @/回复机器人的防刷屏冷却；开启后连续恶意 @ 不会每条都触发模型回复",
+    "description": "点名防刷屏",
+    "hint": "启用原生 @、回复机器人、文字点名机器人的防刷屏冷却；开启后连续点名不会每条都触发模型回复。",
     "type": "bool",
     "default": true
   },
   "directed_reply_group_cooldown_sec": {
-    "description": "同一群聊内原生 @/回复机器人的全局冷却时间（秒）",
+    "description": "群点名冷却（秒）",
+    "hint": "同一群聊内点名机器人回复的全局冷却时间。",
     "type": "int",
     "default": 8
   },
   "directed_reply_sender_cooldown_sec": {
-    "description": "同一群聊内同一发送者原生 @/回复机器人的冷却时间（秒）",
+    "description": "个人点名冷却（秒）",
+    "hint": "同一群聊内同一发送者点名机器人回复的冷却时间。",
     "type": "int",
     "default": 60
   },
   "directed_reply_owner_bypass": {
-    "description": "主人是否绕过原生 @/回复机器人的防刷屏冷却",
+    "description": "主人绕过点名冷却",
+    "hint": "主人是否绕过 @、回复机器人、文字点名机器人的防刷屏冷却。",
     "type": "bool",
     "default": true
   },
   "owner_ids": {
-    "description": "主人用户 ID 列表；用于主人绕过防刷屏冷却。仓库默认留空，请在本机配置里填写自己的平台用户 ID",
+    "description": "主人 ID 列表",
+    "hint": "用于主人绕过点名防刷屏冷却。仓库默认留空，请在本机配置里填写自己的平台用户 ID。",
     "type": "list",
     "default": []
   },
   "mention_keywords": {
-    "description": "群聊提到这些关键词时进入智能提及判断；可填写机器人昵称、别名或其他唤醒称呼",
+    "description": "提及关键词",
+    "hint": "群聊提到这些关键词时进入智能提及判断；可填写机器人昵称、别名或其他唤醒称呼。",
     "type": "list",
     "default": ["小昭", "小昭猫娘"]
   },
   "aliases": {
-    "description": "旧版兼容项：触发别名列表；新配置请优先使用 mention_keywords",
+    "description": "旧版别名",
+    "hint": "旧版兼容项：触发别名列表；新配置请优先使用 mention_keywords。",
     "type": "list",
     "default": ["小昭", "小昭猫娘"]
   }
