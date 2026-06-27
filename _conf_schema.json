@@ -19,8 +19,13 @@
     "type": "int",
     "default": 30
   },
+  "mention_keywords": {
+    "description": "群聊提到这些关键词时进入智能提及判断；可填写机器人昵称、别名或其他唤醒称呼",
+    "type": "list",
+    "default": ["小昭", "小昭猫娘"]
+  },
   "aliases": {
-    "description": "触发别名列表",
+    "description": "旧版兼容项：触发别名列表；新配置请优先使用 mention_keywords",
     "type": "list",
     "default": ["小昭", "小昭猫娘"]
   }

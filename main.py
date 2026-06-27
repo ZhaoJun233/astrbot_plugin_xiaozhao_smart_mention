@@ -20,28 +20,91 @@ EXTRA_DECISION = "xiaozhao_smart_mention_decision"
 EXTRA_REASON = "xiaozhao_smart_mention_reason"
 EXTRA_MODE = "xiaozhao_smart_mention_mode"
 
-DEFAULT_ALIASES = ["小昭", "小昭猫娘"]
-RUNTIME_ALIASES = list(DEFAULT_ALIASES)
+DEFAULT_MENTION_KEYWORDS = ["小昭", "小昭猫娘"]
+DEFAULT_ALIASES = DEFAULT_MENTION_KEYWORDS
+RUNTIME_ALIASES = list(DEFAULT_MENTION_KEYWORDS)
 DEFAULT_REPLY_PATTERNS = [
-    r"^(?:小昭|小昭猫娘)[,，!！?？\s]*(?:在吗|出来|来一下|帮|救|看|听|说|解释|告诉|回答|评价|分析|查|写|做|能|可以|是不是|为什么|怎么|咋|如何|吗|呢)",
-    r"(?:问|请|让|叫|喊)(?:一下)?(?:小昭|小昭猫娘)",
-    r"(?:小昭|小昭猫娘).*(?:吗|嘛|呢|么|？|\?|帮我|能不能|可不可以|要不要|怎么|如何|为什么|啥|什么|谁|哪里|哪儿|几点|多少)",
+    r"^(?:{keywords})[,，!！?？\s]*(?:在吗|出来|来一下|帮|救|看|听|说|解释|告诉|回答|评价|分析|查|写|做|能|可以|是不是|为什么|怎么|咋|如何|吗|呢)",
+    r"(?:问|请|让|叫|喊)(?:一下)?(?:{keywords})",
+    r"(?:{keywords}).*(?:吗|嘛|呢|么|？|\?|帮我|能不能|可不可以|要不要|怎么|如何|为什么|啥|什么|谁|哪里|哪儿|几点|多少)",
 ]
 DEFAULT_SKIP_PATTERNS = [
-    r"(?:小昭|小昭猫娘).*(?:别回|不要回|不用回|别回复|不要回复|不用回复|别理|不用理|不要理)",
+    r"(?:{keywords}).*(?:别回|不要回|不用回|别回复|不要回复|不用回复|别理|不用理|不要理)",
 ]
+
+
+def _dedupe(items: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        item = str(item).strip()
+        if not item or item in seen:
+            continue
+        result.append(item)
+        seen.add(item)
+    return result
 
 
 def _compile_patterns(patterns: Iterable[str]) -> list[re.Pattern[str]]:
     return [re.compile(pattern, re.IGNORECASE) for pattern in patterns if pattern]
 
 
-def _as_list(value, fallback: list[str]) -> list[str]:
+def _as_list(
+    value,
+    fallback: list[str],
+    *,
+    split_string: bool = False,
+) -> list[str]:
     if isinstance(value, list):
-        return [str(item) for item in value if str(item).strip()]
+        return _dedupe(str(item) for item in value)
     if isinstance(value, str) and value.strip():
-        return [value.strip()]
+        if split_string:
+            return _dedupe(re.split(r"[\n,，、]+", value))
+        return _dedupe([value])
     return list(fallback)
+
+
+def _resolve_mention_keywords(config) -> list[str]:
+    mention_keywords = _as_list(
+        config.get("mention_keywords"),
+        [],
+        split_string=True,
+    )
+    aliases = _as_list(config.get("aliases"), [], split_string=True)
+
+    if (
+        aliases
+        and aliases != DEFAULT_MENTION_KEYWORDS
+        and mention_keywords == DEFAULT_MENTION_KEYWORDS
+    ):
+        return aliases
+    if mention_keywords:
+        return mention_keywords
+    if aliases:
+        return aliases
+    return list(DEFAULT_MENTION_KEYWORDS)
+
+
+def _build_keyword_regex(mention_keywords: Iterable[str]) -> str:
+    escaped = [re.escape(item) for item in _dedupe(mention_keywords)]
+    return "|".join(sorted(escaped, key=len, reverse=True))
+
+
+def _compile_keyword_patterns(
+    patterns: Iterable[str],
+    mention_keywords: Iterable[str],
+) -> list[re.Pattern[str]]:
+    keyword_regex = _build_keyword_regex(mention_keywords)
+    expanded = [
+        pattern.replace("{keywords}", keyword_regex)
+        for pattern in patterns
+        if pattern and keyword_regex
+    ]
+    return _compile_patterns(expanded)
+
+
+def _contains_keyword(text: str, mention_keywords: Iterable[str]) -> bool:
+    return any(keyword and keyword in text for keyword in mention_keywords)
 
 
 class MentionAliasFilter(CustomFilter):
@@ -53,7 +116,7 @@ class MentionAliasFilter(CustomFilter):
         if not text:
             return False
 
-        return any(alias and alias in text for alias in RUNTIME_ALIASES)
+        return _contains_keyword(text, RUNTIME_ALIASES)
 
 
 class Main(Star):
@@ -68,21 +131,24 @@ class Main(Star):
         self.active_reply_cooldown_sec = float(
             self.config.get("active_reply_cooldown_sec", 30),
         )
-        self.aliases = _as_list(self.config.get("aliases"), DEFAULT_ALIASES)
-        RUNTIME_ALIASES = list(self.aliases)
-        self.reply_patterns = _compile_patterns(
+        self.mention_keywords = _resolve_mention_keywords(self.config)
+        self.aliases = list(self.mention_keywords)
+        RUNTIME_ALIASES = list(self.mention_keywords)
+        self.reply_patterns = _compile_keyword_patterns(
             _as_list(self.config.get("reply_patterns"), DEFAULT_REPLY_PATTERNS),
+            self.mention_keywords,
         )
-        self.skip_patterns = _compile_patterns(
+        self.skip_patterns = _compile_keyword_patterns(
             _as_list(self.config.get("skip_patterns"), DEFAULT_SKIP_PATTERNS),
+            self.mention_keywords,
         )
         self._last_active_reply_at: dict[str, float] = {}
 
     async def initialize(self) -> None:
         logger.info(
-            "%s loaded: aliases=%s, use_llm_judge=%s, active_reply_enabled=%s",
+            "%s loaded: mention_keywords=%s, use_llm_judge=%s, active_reply_enabled=%s",
             PLUGIN_TAG,
-            ",".join(self.aliases),
+            ",".join(self.mention_keywords),
             self.use_llm_judge,
             self.active_reply_enabled,
         )
@@ -146,7 +212,7 @@ class Main(Star):
         text = event.get_message_str().strip()
         if not text:
             return
-        if any(alias and alias in text for alias in self.aliases):
+        if _contains_keyword(text, self.mention_keywords):
             return
 
         cooldown_key = event.unified_msg_origin
@@ -209,7 +275,11 @@ class Main(Star):
         sender_id = event.get_sender_id() or "未知ID"
         reason = event.get_extra(EXTRA_REASON, "smart_mention")
         mode = event.get_extra(EXTRA_MODE, "mention")
-        trigger = "群聊智能主动回复" if mode == "active_reply" else "群聊提到小昭"
+        trigger = (
+            "群聊智能主动回复"
+            if mode == "active_reply"
+            else f"群聊提到{self._mention_keyword_label()}"
+        )
         note = (
             "<system_reminder>"
             f"本轮消息触发方式: {trigger}。"
@@ -260,15 +330,17 @@ class Main(Star):
         if not provider:
             return None
 
+        bot_label = self._primary_mention_keyword()
+        keyword_label = self._mention_keyword_label()
         recent_context = self._recent_group_context(event)
         context_block = (
             f"最近群聊上下文:\n{recent_context}\n\n" if recent_context else ""
         )
         prompt = (
-            "你是群聊机器人“小昭”的回复触发判定器。"
-            "请判断当前群聊消息虽然提到了“小昭”，是否需要小昭回复。\n"
-            "只在以下情况输出 REPLY：用户直接叫小昭、向小昭提问、请求小昭帮忙、需要小昭澄清或回应。\n"
-            "以下情况输出 SKIP：只是旁观讨论、复述/评价小昭之前的话、开玩笑但没有让小昭接话、明确说不用回复。\n"
+            f"你是群聊机器人“{bot_label}”的回复触发判定器。"
+            f"请判断当前群聊消息虽然提到了触发关键词 {keyword_label}，是否需要机器人回复。\n"
+            f"只在以下情况输出 REPLY：用户直接叫{bot_label}或这些触发关键词、向机器人提问、请求机器人帮忙、需要机器人澄清或回应。\n"
+            f"以下情况输出 SKIP：只是旁观讨论、复述/评价{bot_label}之前的话、开玩笑但没有让机器人接话、明确说不用回复。\n"
             "只能输出 REPLY 或 SKIP，不要输出其他内容。\n\n"
             f"群号: {event.get_group_id()}\n"
             f"发言人ID: {event.get_sender_id()}\n"
@@ -303,18 +375,19 @@ class Main(Star):
         if not provider:
             return None
 
+        bot_label = self._primary_mention_keyword()
         recent_context = self._recent_group_context(event)
         context_block = (
             f"最近群聊上下文:\n{recent_context}\n\n" if recent_context else ""
         )
         prompt = (
-            "你是群聊机器人“小昭”的主动回复判定器。"
-            "请判断小昭是否应该在没有被点名、没有被@的情况下主动接一句话。\n"
+            f"你是群聊机器人“{bot_label}”的主动回复判定器。"
+            f"请判断{bot_label}是否应该在没有被点名、没有被@的情况下主动接一句话。\n"
             "只在以下情况输出 REPLY：群里有人提出开放问题或求助、讨论明显卡住、"
-            "有人需要解释/总结/配置帮助、有人邀请大家发表看法、当前话题非常适合小昭自然补充。\n"
+            f"有人需要解释/总结/配置帮助、有人邀请大家发表看法、当前话题非常适合{bot_label}自然补充。\n"
             "以下情况输出 SKIP：普通闲聊、短表情/口头禅、广告或刷屏、两个人正在互相对话、"
             "只是陈述近况、接话会显得突兀、刚刚已经主动回复过类似话题。\n"
-            "要求：宁可少回，不要抢话；只有你认为小昭此刻自然插话会有帮助才 REPLY。\n"
+            f"要求：宁可少回，不要抢话；只有你认为{bot_label}此刻自然插话会有帮助才 REPLY。\n"
             "只能输出 REPLY 或 SKIP，不要输出其他内容。\n\n"
             f"群号: {event.get_group_id()}\n"
             f"发言人ID: {event.get_sender_id()}\n"
@@ -395,6 +468,15 @@ class Main(Star):
         except Exception as exc:
             logger.debug("%s read group context failed: %s", PLUGIN_TAG, exc)
             return ""
+
+    def _primary_mention_keyword(self) -> str:
+        if self.mention_keywords:
+            return self.mention_keywords[0]
+        return DEFAULT_MENTION_KEYWORDS[0]
+
+    def _mention_keyword_label(self) -> str:
+        keywords = self.mention_keywords or DEFAULT_MENTION_KEYWORDS
+        return "、".join(f"“{keyword}”" for keyword in keywords)
 
 
 def _clip(text: str, limit: int = 120) -> str:
