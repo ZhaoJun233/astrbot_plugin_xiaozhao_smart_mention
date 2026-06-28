@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-import re
 import asyncio
+import json
+import random
+import re
+import urllib.error
+import urllib.request
 from collections.abc import AsyncGenerator, Iterable
 from time import monotonic
 
 from astrbot import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At, AtAll, Image, Reply
+from astrbot.api.message_components import At, AtAll, Image, Plain, Reply
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.config import AstrBotConfig
@@ -34,6 +38,10 @@ ACTION_OUTPUT_KEYWORDS = (
     "抬头",
     "点头",
     "摇头",
+    "眼睛",
+    "眼神",
+    "看着",
+    "看向",
     "眨眼",
     "眨眨眼",
     "挠",
@@ -53,6 +61,39 @@ ACTION_OUTPUT_KEYWORDS = (
     "清了清嗓子",
 )
 ACTION_PARENS_RE = re.compile(r"[（(]([^（）()]{1,120})[）)]")
+CHAT_SENTENCE_RE = re.compile(r"[^。！？!?…~～]+[。！？!?…~～]+(?:[❤️❤💕💖✨~～]*)|[^。！？!?…~～]+$")
+STRUCTURED_REPLY_MARKERS = (
+    "```",
+    "`",
+    "\n- ",
+    "\n1.",
+    "\n2.",
+    "|",
+    "http://",
+    "https://",
+    "D:\\",
+    "/AstrBot/",
+)
+TECHNICAL_REPLY_KEYWORDS = (
+    "配置",
+    "路径",
+    "命令",
+    "日志",
+    "插件",
+    "报错",
+    "验证",
+    "action_output_enabled",
+    "natural_chat_style_enabled",
+    "Traceback",
+    "Exception",
+)
+SEGMENT_UNSUPPORTED_PLATFORMS = {
+    "qq_official_webhook",
+    "weixin_official_account",
+    "dingtalk",
+    "webchat",
+}
+SEGMENT_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 DEFAULT_MENTION_KEYWORDS = ["小昭", "小昭猫娘"]
 DEFAULT_ALIASES = DEFAULT_MENTION_KEYWORDS
@@ -148,6 +189,213 @@ def _strip_character_action_output(text: str) -> str:
     return cleaned.strip()
 
 
+def _format_natural_chat_paragraphs(text: str, max_paragraphs: int = 3) -> str:
+    if not text:
+        return text
+
+    max_paragraphs = max(1, max_paragraphs)
+    stripped = text.strip()
+    if "\n\n" in stripped:
+        return "\n\n".join(
+            _format_natural_chat_paragraphs(part, max_paragraphs)
+            for part in stripped.split("\n\n")
+        )
+    if len(stripped) < 45:
+        return stripped
+    if any(marker in stripped for marker in STRUCTURED_REPLY_MARKERS):
+        return stripped
+    if any(keyword in stripped for keyword in TECHNICAL_REPLY_KEYWORDS):
+        return stripped
+
+    sentences = [
+        match.group(0).strip()
+        for match in CHAT_SENTENCE_RE.finditer(stripped)
+        if match.group(0).strip()
+    ]
+    if len(sentences) >= 2 and len(sentences[0]) <= 4 and sentences[0].endswith("…"):
+        sentences = [sentences[0] + sentences[1], *sentences[2:]]
+    if len(sentences) < 2:
+        return stripped
+
+    paragraphs: list[str] = []
+    current = ""
+    for index, sentence in enumerate(sentences):
+        remaining_sentences = len(sentences) - index
+        remaining_slots = max_paragraphs - len(paragraphs)
+        if not current:
+            current = sentence
+            continue
+        if not paragraphs and len(current) <= 18 and len(sentences) >= 3:
+            paragraphs.append(current)
+            current = sentence
+            continue
+        if len(current) < 34 and remaining_sentences >= remaining_slots:
+            current += sentence
+            continue
+        paragraphs.append(current)
+        current = sentence
+    if current:
+        paragraphs.append(current)
+
+    if len(paragraphs) > max_paragraphs:
+        paragraphs = paragraphs[: max_paragraphs - 1] + ["".join(paragraphs[max_paragraphs - 1 :])]
+
+    return "\n\n".join(paragraphs)
+
+
+def _is_structured_or_technical_reply(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if any(marker in stripped for marker in STRUCTURED_REPLY_MARKERS):
+        return True
+    if re.search(r"(^|\n)\s*(?:[-*]|\d+[.、])\s+", stripped):
+        return True
+    if re.search(r"(Traceback|Exception|Error:|\[[A-Z]+\]|\w+Error\b)", stripped):
+        return True
+    if re.search(r"(?m)^\s*(?:python|pip|docker|git|npm|pnpm|yarn|cd|cat|tail)\s+", stripped):
+        return True
+    if (
+        any(keyword in stripped for keyword in TECHNICAL_REPLY_KEYWORDS)
+        and ("\n" in stripped or ":" in stripped or "：" in stripped)
+        and re.search(r"(配置|路径|命令|日志|报错|验证).{0,12}[:：]", stripped)
+    ):
+        return True
+    return False
+
+
+def _natural_local_segments(text: str, max_segments: int) -> list[str]:
+    formatted = _format_natural_chat_paragraphs(text, max_segments)
+    segments = [
+        segment.strip()
+        for segment in re.split(r"\n{2,}", formatted)
+        if segment.strip()
+    ]
+    if not segments and text.strip():
+        segments = [text.strip()]
+    return segments[:max(1, max_segments)]
+
+
+def _extract_segment_json(text: str) -> dict | None:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    candidates = [stripped]
+    match = SEGMENT_JSON_RE.search(stripped)
+    if match:
+        candidates.append(match.group(0))
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _normalise_model_segments(original: str, raw: str, max_segments: int) -> list[str] | None:
+    data = _extract_segment_json(raw)
+    if not data:
+        return None
+    should_split = data.get("split", True)
+    if should_split is False:
+        return []
+    raw_segments = data.get("segments")
+    if not isinstance(raw_segments, list):
+        return None
+    segments = _dedupe(
+        str(segment).strip()
+        for segment in raw_segments
+        if isinstance(segment, str) and segment.strip()
+    )
+    if not _are_usable_segments(original, segments, max_segments):
+        return None
+    return segments
+
+
+def _are_usable_segments(original: str, segments: list[str], max_segments: int) -> bool:
+    if len(segments) < 2 or len(segments) > max(1, max_segments):
+        return False
+    joined = "".join(segments)
+    if len(joined) > max(len(original) * 2, len(original) + 80):
+        return False
+    if any(segment.lower().startswith(("整理后的", "以下是", "好的", "可以，")) for segment in segments):
+        return False
+    return True
+
+
+def _normalise_chat_completions_url(api_base: str) -> str:
+    base = api_base.strip().rstrip("/")
+    if base.endswith("/chat/completions"):
+        return base
+    if base.endswith("/v1"):
+        return f"{base}/chat/completions"
+    return f"{base}/v1/chat/completions"
+
+
+def _extract_openai_completion_text(body: dict) -> str:
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+    message = first.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if content is not None:
+            return str(content)
+    text = first.get("text")
+    if text is not None:
+        return str(text)
+    return ""
+
+
+async def _post_openai_chat_completion(
+    *,
+    api_base: str,
+    api_key: str,
+    model: str,
+    prompt: str,
+    system_prompt: str,
+    timeout: float,
+    temperature: float = 0,
+) -> str:
+    url = _normalise_chat_completions_url(api_base)
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": temperature,
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    def request() -> str:
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(512).decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+        body = json.loads(raw)
+        if not isinstance(body, dict):
+            return ""
+        return _extract_openai_completion_text(body).strip()
+
+    return await asyncio.to_thread(request)
+
+
 def _resolve_mention_keywords(config) -> list[str]:
     mention_keywords = _as_list(
         config.get("mention_keywords"),
@@ -211,6 +459,10 @@ class Main(Star):
         global RUNTIME_ALIASES
         self.use_llm_judge = bool(self.config.get("use_llm_judge", True))
         self.judge_timeout_sec = float(self.config.get("judge_timeout_sec", 8))
+        self.custom_ai_enabled = bool(self.config.get("custom_ai_enabled", False))
+        self.custom_ai_api_base = str(self.config.get("custom_ai_api_base") or "").strip()
+        self.custom_ai_api_key = str(self.config.get("custom_ai_api_key") or "").strip()
+        self.custom_ai_model = str(self.config.get("custom_ai_model") or "").strip()
         self.active_reply_enabled = bool(self.config.get("active_reply_enabled", True))
         self.active_reply_cooldown_sec = float(
             self.config.get("active_reply_cooldown_sec", 30),
@@ -218,12 +470,25 @@ class Main(Star):
         self.natural_chat_style_enabled = bool(
             self.config.get("natural_chat_style_enabled", True),
         )
+        self.smart_segment_enabled = bool(
+            self.config.get("smart_segment_enabled", True),
+        )
+        self.smart_segment_use_model = bool(
+            self.config.get("smart_segment_use_model", True),
+        )
+        self.smart_segment_respect_astrbot = bool(
+            self.config.get("smart_segment_respect_astrbot", True),
+        )
         self.action_output_enabled = bool(
             self.config.get("action_output_enabled", False),
         )
         self.natural_chat_max_sentences = max(
             1,
             _as_int(self.config.get("natural_chat_max_sentences"), 3),
+        )
+        self.smart_segment_interval_sec = max(
+            0.0,
+            _as_float(self.config.get("smart_segment_interval_sec"), 0.8),
         )
         self.followup_reply_window_sec = _as_float(
             self.config.get("followup_reply_window_sec"),
@@ -505,10 +770,11 @@ class Main(Star):
     ) -> None:
         is_smart_reply = event.get_extra(EXTRA_DECISION) == "REPLY"
         is_native_directed = self._has_native_directed_signal(event)
-        if not is_smart_reply and not is_native_directed:
+        if not is_smart_reply and not is_native_directed and not self.natural_chat_style_enabled:
             return
 
-        self._remove_direct_send_tool(req)
+        if is_smart_reply or is_native_directed:
+            self._remove_direct_send_tool(req)
 
         sender_name = event.get_sender_name() or "未知昵称"
         sender_id = event.get_sender_id() or "未知ID"
@@ -525,16 +791,24 @@ class Main(Star):
             if mode == "active_reply"
             else f"群聊提到{self._mention_keyword_label()}"
         )
-        note = (
-            "<system_reminder>"
-            f"本轮消息触发方式: {trigger}。"
-            f"判断原因: {reason}。"
-            f"当前发言人昵称/ID: {sender_name}/{sender_id}。"
-            "请自然回应当前场景；"
-            "不要解释触发机制，不要特意强调对方是不是主人。"
-            f"{self._natural_chat_style_reminder(mode)}"
-            "</system_reminder>"
-        )
+
+        if is_smart_reply or is_native_directed:
+            note_body = (
+                f"本轮消息触发方式: {trigger}。"
+                f"判断原因: {reason}。"
+                f"当前发言人昵称/ID: {sender_name}/{sender_id}。"
+                "请自然回应当前场景；"
+                "不要解释触发机制，不要特意强调对方是不是主人。"
+                f"{self._natural_chat_style_reminder(mode)}"
+            )
+        else:
+            note_body = (
+                f"当前发言人昵称/ID: {sender_name}/{sender_id}。"
+                "请自然回应当前场景；不要主动说明内部规则。"
+                f"{self._natural_chat_style_reminder('plain_llm')}"
+            )
+
+        note = f"<system_reminder>{note_body}</system_reminder>"
         req.system_prompt = (req.system_prompt or "") + "\n" + note
 
     def _natural_chat_style_reminder(self, mode: str) -> str:
@@ -542,9 +816,9 @@ class Main(Star):
             return ""
 
         reminder = (
-            "按实时群聊的自然对话来回：日常接话可以用 "
-            f"1-{self.natural_chat_max_sentences} 个很短的聊天段落/短句分段，"
-            "像真人顺手回几句；不要写成长篇正式问答。"
+            "按实时群聊的自然对话来回：日常接话按语气、停顿和信息密度自行判断是否拆成短段，"
+            f"确实需要分段时最多 {self.natural_chat_max_sentences} 个很短的聊天段落/短句，"
+            "不要为了凑数量而拆分；像真人顺手回几句，不要写成长篇正式问答。"
             "遇到列表、步骤、总结、配置说明时，收束成一段紧凑的结构化回答。"
             "不要每句都抢答，只在当前话题需要时简短接话。"
         )
@@ -562,12 +836,10 @@ class Main(Star):
         if self.action_output_enabled:
             return
 
-        get_message_type = getattr(event, "get_message_type", None)
-        if callable(get_message_type) and get_message_type() != MessageType.GROUP_MESSAGE:
-            return
-
         text = getattr(resp, "completion_text", "") or ""
         cleaned = _strip_character_action_output(text)
+        if self.natural_chat_style_enabled:
+            cleaned = await self._rewrite_reply_naturally(event, cleaned)
         if cleaned == text:
             return
 
@@ -575,9 +847,234 @@ class Main(Star):
         logger.info(
             "%s action output stripped: group=%s sender=%s",
             PLUGIN_TAG,
-            event.get_group_id(),
-            event.get_sender_id(),
+            _safe_event_value(event, "get_group_id", "unknown"),
+            _safe_event_value(event, "get_sender_id", "unknown"),
         )
+
+    def _custom_ai_ready(self) -> bool:
+        return (
+            self.custom_ai_enabled
+            and bool(self.custom_ai_api_base)
+            and bool(self.custom_ai_model)
+        )
+
+    def _get_current_provider(self, event: AstrMessageEvent):
+        get_provider = getattr(self.context, "get_using_provider", None)
+        if not callable(get_provider):
+            return None
+        return get_provider(event.unified_msg_origin)
+
+    async def _call_internal_model(
+        self,
+        event: AstrMessageEvent,
+        *,
+        prompt: str,
+        system_prompt: str,
+        timeout: float,
+    ) -> str | None:
+        custom_exc: Exception | None = None
+        if self._custom_ai_ready():
+            try:
+                text = await _post_openai_chat_completion(
+                    api_base=self.custom_ai_api_base,
+                    api_key=self.custom_ai_api_key,
+                    model=self.custom_ai_model,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    timeout=timeout,
+                )
+                if text:
+                    return text
+            except Exception as exc:
+                custom_exc = exc
+                logger.warning(
+                    "%s custom ai failed, fallback to current provider: %s",
+                    PLUGIN_TAG,
+                    _format_exception(exc),
+                )
+
+        provider = self._get_current_provider(event)
+        if provider is None:
+            if custom_exc is not None:
+                raise custom_exc
+            return None
+
+        resp = await asyncio.wait_for(
+            provider.text_chat(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                contexts=[],
+                request_max_retries=1,
+            ),
+            timeout=timeout,
+        )
+        return (getattr(resp, "completion_text", "") or "").strip()
+
+    async def _rewrite_reply_naturally(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+    ) -> str:
+        local_formatted = _format_natural_chat_paragraphs(text)
+
+        prompt = (
+            "请只调整下面回复的表达格式，不要改变原意，不要新增信息。\n"
+            "要求：\n"
+            "1. 删除括号动作描写、舞台旁白、身体动作描述。\n"
+            "2. 如果是日常聊天，按语气和停顿自行判断是否拆成多个自然短段，每段之间用一个空行。\n"
+            f"3. 不要为了凑数量而拆分；确实需要分段时最多 {self.natural_chat_max_sentences} 段。\n"
+            "4. 如果是技术、配置、列表、代码或命令说明，保持结构清晰，不要乱拆。\n"
+            "5. 只输出整理后的回复正文，不要解释。\n\n"
+            f"原回复：\n{text}"
+        )
+        try:
+            rewritten = await self._call_internal_model(
+                event,
+                prompt=prompt,
+                system_prompt="你是回复格式整理器，只调整格式和删除括号动作描写，不改意思。",
+                timeout=min(self.judge_timeout_sec, 5),
+            )
+        except Exception as exc:
+            logger.debug(
+                "%s natural rewrite failed: %s",
+                PLUGIN_TAG,
+                _format_exception(exc),
+            )
+            return local_formatted
+
+        rewritten = (rewritten or "").strip()
+        if not _is_usable_rewrite(text, rewritten):
+            return local_formatted
+        return rewritten
+
+    @filter.on_decorating_result(priority=-80)
+    async def send_natural_segments(self, event: AstrMessageEvent) -> None:
+        if not self._should_take_over_segment_send(event):
+            return
+
+        result = event.get_result()
+        if result is None or not getattr(result, "chain", None):
+            return
+
+        plain = self._single_plain_text(result.chain)
+        if plain is None:
+            return
+
+        text = plain.strip()
+        if len(text) < 45 or _is_structured_or_technical_reply(text):
+            return
+
+        segments = await self._build_natural_segments(event, text)
+        if len(segments) < 2:
+            return
+
+        for index, segment in enumerate(segments):
+            if index > 0 and self.smart_segment_interval_sec > 0:
+                await asyncio.sleep(
+                    random.uniform(
+                        self.smart_segment_interval_sec * 0.7,
+                        self.smart_segment_interval_sec * 1.3,
+                    ),
+                )
+            await event.send(result.derive([Plain(segment)]))
+
+        event.clear_result()
+        logger.info(
+            "%s smart segmented send: group=%s sender=%s segments=%s",
+            PLUGIN_TAG,
+            _safe_event_value(event, "get_group_id", "unknown"),
+            _safe_event_value(event, "get_sender_id", "unknown"),
+            len(segments),
+        )
+
+    def _should_take_over_segment_send(self, event: AstrMessageEvent) -> bool:
+        if not self.natural_chat_style_enabled or not self.smart_segment_enabled:
+            return False
+        get_platform_name = getattr(event, "get_platform_name", None)
+        if callable(get_platform_name):
+            try:
+                if get_platform_name() in SEGMENT_UNSUPPORTED_PLATFORMS:
+                    return False
+            except Exception:
+                pass
+
+        result = event.get_result()
+        if result is None or not _safe_is_model_result(result):
+            return False
+
+        if self.smart_segment_respect_astrbot and self._astrbot_segmented_reply_enabled(event):
+            return False
+        return True
+
+    def _astrbot_segmented_reply_enabled(self, event: AstrMessageEvent) -> bool:
+        get_config = getattr(self.context, "get_config", None)
+        if not callable(get_config):
+            return False
+        try:
+            cfg = get_config(event.unified_msg_origin)
+        except Exception:
+            return False
+        try:
+            return bool(cfg.get("platform_settings", {}).get("segmented_reply", {}).get("enable"))
+        except Exception:
+            return False
+
+    def _single_plain_text(self, chain: list) -> str | None:
+        plain_parts = []
+        for comp in chain:
+            if not isinstance(comp, Plain):
+                return None
+            plain_parts.append(comp.text or "")
+        text = "".join(plain_parts).strip()
+        return text or None
+
+    async def _build_natural_segments(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+    ) -> list[str]:
+        local_segments = _natural_local_segments(text, self.natural_chat_max_sentences)
+        if not self.smart_segment_use_model:
+            return local_segments
+
+        prompt = (
+            "请把下面这条聊天回复切成更自然的多条即时聊天消息。\n"
+            "只调整分段，不改原意，不新增信息，不改变称呼和语气。\n"
+            "由你根据真实聊天语气、停顿和信息密度判断应该分成几条；不要固定段数，也不要为了拆而拆。\n"
+            "如果它更适合一条消息，返回 split=false。\n"
+            f"为避免刷屏，确实需要拆分时最多 {self.natural_chat_max_sentences} 条。\n\n"
+            f"原回复：\n{text}"
+        )
+        try:
+            raw = await self._call_internal_model(
+                event,
+                prompt=prompt,
+                system_prompt=(
+                    "你是聊天消息分段器。必须只输出 JSON，格式为 "
+                    '{"split": true, "segments": ["第一段", "第二段"]}。'
+                    "segments 数量由自然语气决定，不固定；更适合一条时输出 "
+                    '{"split": false, "segments": []}。'
+                    "不要输出解释、Markdown 或代码块。"
+                ),
+                timeout=min(self.judge_timeout_sec, 5),
+            )
+        except Exception as exc:
+            logger.debug(
+                "%s smart segment failed: %s",
+                PLUGIN_TAG,
+                _format_exception(exc),
+            )
+            return local_segments
+
+        raw = (raw or "").strip()
+        model_segments = _normalise_model_segments(
+            text,
+            raw,
+            self.natural_chat_max_sentences,
+        )
+        if model_segments is None:
+            return local_segments
+        return model_segments
 
     def _remove_direct_send_tool(self, req: ProviderRequest) -> None:
         if req.func_tool is None:
@@ -804,10 +1301,6 @@ class Main(Star):
         return "SKIP", "llm_judge_unavailable"
 
     async def _llm_decide(self, event: AstrMessageEvent, text: str) -> str | None:
-        provider = self.context.get_using_provider(event.unified_msg_origin)
-        if not provider:
-            return None
-
         bot_label = self._primary_mention_keyword()
         keyword_label = self._mention_keyword_label()
         recent_context = self._recent_group_context(event)
@@ -828,13 +1321,10 @@ class Main(Star):
         )
 
         try:
-            resp = await asyncio.wait_for(
-                provider.text_chat(
-                    prompt=prompt,
-                    system_prompt="你只输出 REPLY 或 SKIP。",
-                    contexts=[],
-                    request_max_retries=1,
-                ),
+            answer = await self._call_internal_model(
+                event,
+                prompt=prompt,
+                system_prompt="你只输出 REPLY 或 SKIP。",
                 timeout=self.judge_timeout_sec,
             )
         except Exception as exc:
@@ -846,7 +1336,7 @@ class Main(Star):
             )
             return None
 
-        answer = (getattr(resp, "completion_text", "") or "").strip().upper()
+        answer = (answer or "").strip().upper()
         if "REPLY" in answer and "SKIP" not in answer:
             return "REPLY"
         if "SKIP" in answer and "REPLY" not in answer:
@@ -854,10 +1344,6 @@ class Main(Star):
         return None
 
     async def _active_decide(self, event: AstrMessageEvent, text: str) -> str | None:
-        provider = self.context.get_using_provider(event.unified_msg_origin)
-        if not provider:
-            return None
-
         bot_label = self._primary_mention_keyword()
         recent_context = self._recent_group_context(event)
         context_block = (
@@ -880,13 +1366,10 @@ class Main(Star):
         )
 
         try:
-            resp = await asyncio.wait_for(
-                provider.text_chat(
-                    prompt=prompt,
-                    system_prompt="你只输出 REPLY 或 SKIP。",
-                    contexts=[],
-                    request_max_retries=1,
-                ),
+            answer = await self._call_internal_model(
+                event,
+                prompt=prompt,
+                system_prompt="你只输出 REPLY 或 SKIP。",
                 timeout=self.judge_timeout_sec,
             )
         except Exception as exc:
@@ -898,7 +1381,7 @@ class Main(Star):
             )
             return None
 
-        answer = (getattr(resp, "completion_text", "") or "").strip().upper()
+        answer = (answer or "").strip().upper()
         if "REPLY" in answer and "SKIP" not in answer:
             return "REPLY"
         if "SKIP" in answer and "REPLY" not in answer:
@@ -979,6 +1462,46 @@ def _format_exception(exc: BaseException) -> str:
     if message:
         return message
     return exc.__class__.__name__
+
+
+def _safe_event_value(event: AstrMessageEvent, method_name: str, fallback: str) -> str:
+    method = getattr(event, method_name, None)
+    if not callable(method):
+        return fallback
+    try:
+        value = method()
+    except Exception:
+        return fallback
+    if value is None:
+        return fallback
+    return str(value)
+
+
+def _is_usable_rewrite(original: str, rewritten: str) -> bool:
+    if not rewritten:
+        return False
+    if len(rewritten) > max(len(original) * 2, len(original) + 80):
+        return False
+    lowered = rewritten.lower()
+    if lowered.startswith(("整理后的", "以下是", "好的", "可以，")):
+        return False
+    return True
+
+
+def _safe_is_model_result(result) -> bool:
+    method = getattr(result, "is_model_result", None)
+    if callable(method):
+        try:
+            return bool(method())
+        except Exception:
+            return False
+    method = getattr(result, "is_llm_result", None)
+    if callable(method):
+        try:
+            return bool(method())
+        except Exception:
+            return False
+    return False
 
 
 def _stop_event_silently(event: AstrMessageEvent) -> None:

@@ -11,6 +11,30 @@
     "type": "int",
     "default": 8
   },
+  "custom_ai_enabled": {
+    "description": "自定义内部智能模型",
+    "hint": "开启后，插件自己的提及判定、主动回复判定、自然改写和智能分段会优先调用自定义 OpenAI 兼容接口；失败时退回 AstrBot 当前 provider。",
+    "type": "bool",
+    "default": false
+  },
+  "custom_ai_api_base": {
+    "description": "自定义模型 API URL",
+    "hint": "OpenAI 兼容接口地址，可填 https://example.com/v1，也可填完整的 /chat/completions 地址。留空时使用 AstrBot 当前 provider。",
+    "type": "string",
+    "default": ""
+  },
+  "custom_ai_api_key": {
+    "description": "自定义模型 API Key",
+    "hint": "自定义接口的密钥。仅保存在本机插件配置中；如果本地代理不需要鉴权，可以留空。",
+    "type": "string",
+    "default": ""
+  },
+  "custom_ai_model": {
+    "description": "自定义模型名称",
+    "hint": "传给 OpenAI 兼容接口的 model 字段，例如 gpt-4o-mini、deepseek-chat 或本地网关里的模型名。",
+    "type": "string",
+    "default": ""
+  },
   "active_reply_enabled": {
     "description": "主动回复",
     "hint": "启用普通群聊中未被点名时的智能主动回复。",
@@ -29,6 +53,30 @@
     "type": "bool",
     "default": true
   },
+  "smart_segment_enabled": {
+    "description": "插件智能分段发送",
+    "hint": "AstrBot 全局分段关闭时，由插件在发送前调用当前模型判断自然分段，并拆成多条消息发送；结构化、技术、列表和非纯文本回复会保守跳过。",
+    "type": "bool",
+    "default": true
+  },
+  "smart_segment_use_model": {
+    "description": "使用内部智能模型分析分段",
+    "hint": "开启后使用插件内部智能模型输出自然分段 JSON；如已配置自定义内部模型则优先使用自定义接口，否则使用当前会话模型。模型不可用或返回不合规时退回本地自然分段。",
+    "type": "bool",
+    "default": true
+  },
+  "smart_segment_respect_astrbot": {
+    "description": "避让 AstrBot 全局分段",
+    "hint": "开启后如果 AstrBot 自带分段回复已启用，插件不接管发送，避免重复分段；关闭后插件始终优先处理符合条件的纯文本模型回复。",
+    "type": "bool",
+    "default": true
+  },
+  "smart_segment_interval_sec": {
+    "description": "插件分段间隔（秒）",
+    "hint": "插件接管分段发送时，多条消息之间的基础间隔；实际会有少量随机浮动。设为 0 可关闭等待。",
+    "type": "float",
+    "default": 0.8
+  },
   "action_output_enabled": {
     "description": "允许动作描写输出",
     "hint": "是否允许输出括号动作描写、舞台旁白或耳朵/尾巴/爪爪等动作。默认关闭；需要角色扮演时可开启。",
@@ -36,8 +84,8 @@
     "default": false
   },
   "natural_chat_max_sentences": {
-    "description": "自然回复最大短段数",
-    "hint": "自然群聊风格约束下日常聊天默认使用的最大短段/短句分段数；列表、步骤、总结、配置说明会收束成更紧凑的结构化回答。",
+    "description": "自然分段安全上限",
+    "hint": "日常聊天由模型根据语气和信息密度自行判断分成几条；此项只限制最多短段/短句数量，避免刷屏。列表、步骤、总结、配置说明会收束成更紧凑的结构化回答。",
     "type": "int",
     "default": 3
   },

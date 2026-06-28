@@ -60,6 +60,13 @@ def _install_astrbot_test_stubs() -> None:
 
             return decorator
 
+        @staticmethod
+        def on_decorating_result(*args, **kwargs):
+            def decorator(func):
+                return func
+
+            return decorator
+
     api_event.AstrMessageEvent = AstrMessageEvent
     api_event.filter = _Filter
     sys.modules["astrbot.api.event"] = api_event
@@ -77,6 +84,10 @@ def _install_astrbot_test_stubs() -> None:
         async def convert_to_file_path(self) -> str:
             return ""
 
+    class Plain:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
     class Reply:
         def __init__(self, sender_id=None) -> None:
             self.sender_id = sender_id
@@ -84,6 +95,7 @@ def _install_astrbot_test_stubs() -> None:
     api_message_components.At = At
     api_message_components.AtAll = AtAll
     api_message_components.Image = Image
+    api_message_components.Plain = Plain
     api_message_components.Reply = Reply
     sys.modules["astrbot.api.message_components"] = api_message_components
 
@@ -138,6 +150,7 @@ def _install_astrbot_test_stubs() -> None:
 
     class MessageType:
         GROUP_MESSAGE = "GROUP_MESSAGE"
+        FRIEND_MESSAGE = "FRIEND_MESSAGE"
 
     message_type.MessageType = MessageType
     sys.modules["astrbot.core.platform.message_type"] = message_type
@@ -181,14 +194,20 @@ except ModuleNotFoundError:
     from astrbot.core.agent.tool import FunctionTool, ToolSet
     from astrbot.core.provider.entities import ProviderRequest
 
+import main as plugin_main
 from main import (
     EXTRA_DECISION,
     EXTRA_REASON,
     Main,
     _format_exception,
+    _format_natural_chat_paragraphs,
+    _is_structured_or_technical_reply,
+    _natural_local_segments,
     _stop_event_silently,
     _strip_character_action_output,
 )
+
+from astrbot.api.message_components import Plain
 
 
 class FakeEvent:
@@ -199,12 +218,14 @@ class FakeEvent:
         sender_id: str = "user-a",
         self_id: str = "bot-a",
         text: str = "",
+        message_type: str = "GROUP_MESSAGE",
     ) -> None:
         self.unified_msg_origin = f"aiocqhttp:GroupMessage:{group_id}"
         self._group_id = group_id
         self._sender_id = sender_id
         self._self_id = self_id
         self._text = text
+        self._message_type = message_type
         self._extras = {}
         self._force_stopped = False
         self.is_at_or_wake_command = False
@@ -212,6 +233,7 @@ class FakeEvent:
         self.session_id = group_id
         self.stop_event_called = False
         self.result = None
+        self.sent_messages = []
 
     def get_group_id(self) -> str:
         return self._group_id
@@ -224,6 +246,9 @@ class FakeEvent:
 
     def get_message_str(self) -> str:
         return self._text
+
+    def get_message_type(self) -> str:
+        return self._message_type
 
     def get_messages(self) -> list:
         return []
@@ -242,6 +267,15 @@ class FakeEvent:
 
     def request_llm(self, **kwargs) -> ProviderRequest:
         return ProviderRequest(**kwargs)
+
+    def get_result(self):
+        return self.result
+
+    def clear_result(self) -> None:
+        self.result = None
+
+    async def send(self, message) -> None:
+        self.sent_messages.append(message)
 
     def stop_event(self) -> None:
         self.stop_event_called = True
@@ -264,6 +298,36 @@ async def _return_skip(event, text):
 
 async def _return_conversation(event):
     return object()
+
+
+class FakeProvider:
+    def __init__(self, completion_text: str) -> None:
+        self.completion_text = completion_text
+        self.calls = []
+
+    async def text_chat(self, **kwargs):
+        self.calls.append(kwargs)
+        return types.SimpleNamespace(completion_text=self.completion_text)
+
+
+class FakeContext:
+    def __init__(self, provider=None) -> None:
+        self.provider = provider
+
+    def get_using_provider(self, unified_msg_origin):
+        return self.provider
+
+
+class FakeResult:
+    def __init__(self, chain, *, model_result: bool = True) -> None:
+        self.chain = chain
+        self._model_result = model_result
+
+    def is_model_result(self) -> bool:
+        return self._model_result
+
+    def derive(self, chain):
+        return FakeResult(chain, model_result=self._model_result)
 
 
 class DirectedReplyGuardTest(unittest.TestCase):
@@ -618,11 +682,29 @@ class DirectedReplyGuardTest(unittest.TestCase):
 
         self.assertIn("括号动作描写", request.system_prompt)
         self.assertIn("舞台旁白", request.system_prompt)
-        self.assertIn("1-3", request.system_prompt)
+        self.assertIn("最多 3", request.system_prompt)
+        self.assertIn("自行判断", request.system_prompt)
         self.assertIn("聊天段落", request.system_prompt)
         self.assertIn("列表、步骤、总结、配置说明", request.system_prompt)
         self.assertIn("不要每句都抢答", request.system_prompt)
         self.assertIn("简短接话", request.system_prompt)
+
+    def test_plain_private_llm_request_gets_natural_style_guardrails(self) -> None:
+        plugin = build_plugin({"mention_keywords": ["小昭"]})
+        event = FakeEvent(
+            group_id="private-a",
+            sender_id="user-a",
+            text="测试",
+            message_type="FRIEND_MESSAGE",
+        )
+        request = ProviderRequest(system_prompt="base prompt")
+
+        asyncio.run(plugin.decorate_llm_request(event, request))
+
+        self.assertIn("当前发言人昵称/ID", request.system_prompt)
+        self.assertIn("括号动作描写", request.system_prompt)
+        self.assertIn("最多 3", request.system_prompt)
+        self.assertIn("自行判断", request.system_prompt)
 
     def test_active_reply_style_emphasizes_lightweight_non_intrusive_reply(self) -> None:
         plugin = build_plugin({"mention_keywords": ["小昭"]})
@@ -664,11 +746,70 @@ class DirectedReplyGuardTest(unittest.TestCase):
 
         asyncio.run(custom.decorate_llm_request(custom_event, custom_request))
 
-        self.assertIn("1-3", custom_request.system_prompt)
+        self.assertIn("最多 3", custom_request.system_prompt)
+        self.assertIn("自行判断", custom_request.system_prompt)
         self.assertIn("聊天段落", custom_request.system_prompt)
 
     def test_empty_exception_name_is_logged(self) -> None:
         self.assertEqual(_format_exception(TimeoutError()), "TimeoutError")
+
+    def test_custom_internal_model_is_used_for_llm_judge(self) -> None:
+        provider = FakeProvider("SKIP")
+        plugin = build_plugin(
+            {
+                "custom_ai_enabled": True,
+                "custom_ai_api_base": "https://custom.example/v1",
+                "custom_ai_api_key": "test-key",
+                "custom_ai_model": "judge-model",
+            },
+        )
+        plugin.context = FakeContext(provider)
+        event = FakeEvent(group_id="group-a", sender_id="user-a")
+        calls = []
+
+        async def fake_post(**kwargs):
+            calls.append(kwargs)
+            return "REPLY"
+
+        original = plugin_main._post_openai_chat_completion
+        plugin_main._post_openai_chat_completion = fake_post
+        try:
+            decision = asyncio.run(plugin._llm_decide(event, "小昭，这个要怎么处理？"))
+        finally:
+            plugin_main._post_openai_chat_completion = original
+
+        self.assertEqual(decision, "REPLY")
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["api_base"], "https://custom.example/v1")
+        self.assertEqual(calls[0]["api_key"], "test-key")
+        self.assertEqual(calls[0]["model"], "judge-model")
+
+    def test_custom_internal_model_failure_falls_back_to_current_provider(self) -> None:
+        provider = FakeProvider("SKIP")
+        plugin = build_plugin(
+            {
+                "custom_ai_enabled": True,
+                "custom_ai_api_base": "https://custom.example/v1",
+                "custom_ai_api_key": "test-key",
+                "custom_ai_model": "judge-model",
+            },
+        )
+        plugin.context = FakeContext(provider)
+        event = FakeEvent(group_id="group-a", sender_id="user-a")
+
+        async def fake_post(**kwargs):
+            raise RuntimeError("custom endpoint unavailable")
+
+        original = plugin_main._post_openai_chat_completion
+        plugin_main._post_openai_chat_completion = fake_post
+        try:
+            decision = asyncio.run(plugin._llm_decide(event, "小昭，这个要怎么处理？"))
+        finally:
+            plugin_main._post_openai_chat_completion = original
+
+        self.assertEqual(decision, "SKIP")
+        self.assertEqual(len(provider.calls), 1)
 
     def test_character_action_output_is_stripped_by_default(self) -> None:
         self.assertEqual(
@@ -699,6 +840,182 @@ class DirectedReplyGuardTest(unittest.TestCase):
         enabled_resp = Response()
         asyncio.run(enabled.clean_llm_response_actions(event, enabled_resp))
         self.assertEqual(enabled_resp.completion_text, "好，我知道了喵～")
+
+    def test_private_llm_response_action_cleanup_is_applied(self) -> None:
+        class Response:
+            completion_text = (
+                "（接收到测试指令，耳朵机灵地抖了抖，尾巴尖轻轻点了三下）\n\n"
+                "测试反馈来啦喵～！小昭状态正常！（端端正正坐好，冲主人眨了眨眼）"
+            )
+
+        plugin = build_plugin({})
+        event = FakeEvent(
+            group_id="private-a",
+            sender_id="user-a",
+            message_type="FRIEND_MESSAGE",
+        )
+        resp = Response()
+
+        asyncio.run(plugin.clean_llm_response_actions(event, resp))
+
+        self.assertEqual(resp.completion_text, "测试反馈来啦喵～！小昭状态正常！")
+
+    def test_long_casual_reply_is_split_into_short_chat_paragraphs(self) -> None:
+        text = (
+            "呜…被主人抓到了喵。小昭说的「待命中」是日常用语的那个意思——"
+            "就是随时听候主人差遣的意思啦！不是真的要「命中」什么目标，"
+            "主人别逗小昭了喵～再这样下去小昭的尾巴都要打结了！❤️"
+        )
+
+        self.assertEqual(
+            _format_natural_chat_paragraphs(text),
+            (
+                "呜…被主人抓到了喵。\n\n"
+                "小昭说的「待命中」是日常用语的那个意思——就是随时听候主人差遣的意思啦！\n\n"
+                "不是真的要「命中」什么目标，主人别逗小昭了喵～再这样下去小昭的尾巴都要打结了！❤️"
+            ),
+        )
+
+    def test_local_segment_fallback_respects_configured_safety_limit(self) -> None:
+        text = (
+            "呜……被主人抓到了喵。小昭说的待命中是日常用语的那个意思。"
+            "就是随时听候主人差遣的意思啦！不是真的要命中什么目标。"
+            "主人别逗小昭了喵～再这样下去小昭都要不知道怎么接话了。"
+        )
+
+        self.assertLessEqual(len(_natural_local_segments(text, 2)), 2)
+
+    def test_structured_or_technical_reply_is_not_auto_split(self) -> None:
+        text = (
+            "配置检查结果：`action_output_enabled=False`，`natural_chat_style_enabled=True`，"
+            "如果仍然出现动作描写，请先看日志里的 `action output stripped`。"
+        )
+
+        self.assertEqual(_format_natural_chat_paragraphs(text), text)
+
+    def test_casual_reply_with_technical_words_can_still_be_segmented(self) -> None:
+        text = (
+            "到啦到啦～小昭状态正常，收到主人的测试信号了喵！\n\n"
+            "话说刚才有人在问服务器延迟高的事，主人要不要让小昭帮你分析一下可能的原因？"
+            "比如插件冲突、带宽不够、服务器物理位置远之类的，小昭随时可以切技术支持模式上线喵～"
+        )
+
+        self.assertFalse(_is_structured_or_technical_reply(text))
+
+    def test_llm_response_cleanup_also_formats_long_casual_reply(self) -> None:
+        class Response:
+            completion_text = "主人一笑，小昭也跟着开心起来啦喵～刚才那点小尴尬烟消云散，小昭又满血复活了！所以主人～接下来咱们聊点啥，还是有什么正经任务要交给小昭呀？❤️"
+
+        plugin = build_plugin({})
+        event = FakeEvent(group_id="private-a", sender_id="user-a")
+        resp = Response()
+
+        asyncio.run(plugin.clean_llm_response_actions(event, resp))
+
+        self.assertIn("\n\n", resp.completion_text)
+        self.assertEqual(resp.completion_text.count("\n\n"), 2)
+
+    def test_real_test_reply_is_stripped_and_split(self) -> None:
+        class Response:
+            completion_text = (
+                "收到测试信号喵～！小昭状态报告：系统正常、动作括号运行稳定、"
+                "护主模块待命中、可爱值满格！（眼睛亮晶晶地看着主人）"
+                "\n\n主人尽管放心，小昭随时在线，不会掉链子的喵～❤️"
+            )
+
+        provider = FakeProvider(
+            (
+                "收到测试信号喵～！\n\n"
+                "小昭状态报告：系统正常、护主模块待命中、可爱值满格！\n\n"
+                "主人尽管放心，小昭随时在线，不会掉链子的喵～❤️"
+            ),
+        )
+        plugin = build_plugin({})
+        plugin.context = FakeContext(provider)
+        event = FakeEvent(group_id="private-a", sender_id="user-a")
+        resp = Response()
+
+        asyncio.run(plugin.clean_llm_response_actions(event, resp))
+
+        self.assertEqual(len(provider.calls), 1)
+        self.assertIn("只调整格式", provider.calls[0]["system_prompt"])
+        self.assertNotIn("（", resp.completion_text)
+        self.assertNotIn("眼睛亮晶晶", resp.completion_text)
+        self.assertIn("\n\n", resp.completion_text)
+        self.assertEqual(
+            resp.completion_text,
+            (
+                "收到测试信号喵～！\n\n"
+                "小昭状态报告：系统正常、护主模块待命中、可爱值满格！\n\n"
+                "主人尽管放心，小昭随时在线，不会掉链子的喵～❤️"
+            ),
+        )
+
+    def test_real_test_reply_falls_back_to_local_formatting_without_provider(self) -> None:
+        class Response:
+            completion_text = (
+                "收到测试信号喵～！小昭状态报告：系统正常、动作括号运行稳定、"
+                "护主模块待命中、可爱值满格！（眼睛亮晶晶地看着主人）"
+                "\n\n主人尽管放心，小昭随时在线，不会掉链子的喵～❤️"
+            )
+
+        plugin = build_plugin({})
+        event = FakeEvent(group_id="private-a", sender_id="user-a")
+        resp = Response()
+
+        asyncio.run(plugin.clean_llm_response_actions(event, resp))
+
+        self.assertNotIn("（", resp.completion_text)
+        self.assertNotIn("眼睛亮晶晶", resp.completion_text)
+        self.assertIn("\n\n", resp.completion_text)
+        self.assertIn("收到测试信号喵～！", resp.completion_text)
+
+    def test_decorating_result_sends_model_segments_as_separate_messages(self) -> None:
+        provider = FakeProvider(
+            '{"segments":["收到测试信号喵～！","小昭状态正常，可爱值也在线！","主人还想测什么，小昭继续陪着。"]}',
+        )
+        plugin = build_plugin({"smart_segment_interval_sec": 0})
+        plugin.context = FakeContext(provider)
+        event = FakeEvent(group_id="private-a", sender_id="user-a")
+        event.result = FakeResult(
+            [
+                Plain(
+                    "收到测试信号喵～！小昭状态正常，可爱值也在线，刚刚那次调用没有掉线。主人还想测什么，小昭继续陪着。",
+                ),
+            ],
+        )
+
+        asyncio.run(plugin.send_natural_segments(event))
+
+        self.assertIsNone(event.result)
+        self.assertEqual(len(event.sent_messages), 3)
+        self.assertEqual([msg.chain[0].text for msg in event.sent_messages], [
+            "收到测试信号喵～！",
+            "小昭状态正常，可爱值也在线！",
+            "主人还想测什么，小昭继续陪着。",
+        ])
+        self.assertIn("JSON", provider.calls[0]["system_prompt"])
+        self.assertIn("数量由自然语气决定，不固定", provider.calls[0]["system_prompt"])
+        self.assertIn("不要固定段数", provider.calls[0]["prompt"])
+
+    def test_decorating_result_keeps_structured_reply_on_default_pipeline(self) -> None:
+        provider = FakeProvider('{"segments":["不应该调用"]}')
+        plugin = build_plugin({})
+        plugin.context = FakeContext(provider)
+        event = FakeEvent(group_id="private-a", sender_id="user-a")
+        event.result = FakeResult(
+            [
+                Plain(
+                    "配置检查结果：\n1. action_output_enabled=False\n2. natural_chat_style_enabled=True",
+                ),
+            ],
+        )
+
+        asyncio.run(plugin.send_natural_segments(event))
+
+        self.assertIsNotNone(event.result)
+        self.assertEqual(event.sent_messages, [])
+        self.assertEqual(provider.calls, [])
 
     def test_natural_chat_style_prefers_short_chat_segments(self) -> None:
         plugin = build_plugin({})

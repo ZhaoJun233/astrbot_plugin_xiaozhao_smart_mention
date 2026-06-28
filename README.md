@@ -10,7 +10,9 @@
 - 支持短时间续聊：小昭刚回复某人后，同一人不再点名但继续追问时也能自然接上。
 - 自动读取 AstrBot 当前群聊上下文，辅助判断当前对话场景。
 - 对插件触发的回复追加系统提醒，让小昭自然回应，不解释触发机制，也不特意强调对方是不是主人。
-- 默认追加自然群聊风格约束：日常聊天可用 1-3 个短段/短句自然分段；列表、步骤、总结、配置说明时收束成紧凑回答；默认关闭括号动作描写和舞台动作输出。
+- 默认追加自然群聊风格约束：日常聊天由模型按语气和停顿判断是否拆成短段；列表、步骤、总结、配置说明时收束成紧凑回答；默认关闭括号动作描写和舞台动作输出。
+- AstrBot 全局分段关闭时，可由插件调用内部智能模型分析回复，把日常聊天拆成更自然的多条消息发送；结构化、技术、列表和非纯文本回复会保守跳过。
+- 插件内部智能模型支持自定义 OpenAI 兼容 URL、API Key 和模型名；未配置或调用失败时自动退回 AstrBot 当前 provider。
 - 原生 `@机器人`、回复机器人消息等场景会先经过防刷屏冷却，再交给 AstrBot 默认流程处理。
 - 主人 ID 可在插件配置里自定义；仓库默认不写入任何真实用户 ID。
 
@@ -71,11 +73,19 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 | --- | --- | --- | --- |
 | `use_llm_judge` | bool | `true` | 规则无法明确判断时，调用当前模型判断是否回复。 |
 | `judge_timeout_sec` | int | `8` | 智能判定模型调用超时时间，单位秒。 |
+| `custom_ai_enabled` | bool | `false` | 是否启用自定义内部智能模型。开启后，提及判定、主动回复判定、自然改写和智能分段优先调用自定义 OpenAI 兼容接口。 |
+| `custom_ai_api_base` | string | `""` | 自定义模型 API URL，可填 `https://example.com/v1`，也可填完整 `/chat/completions` 地址。 |
+| `custom_ai_api_key` | string | `""` | 自定义模型 API Key。本地代理不需要鉴权时可留空。 |
+| `custom_ai_model` | string | `""` | 自定义模型名，会作为 OpenAI 兼容接口的 `model` 字段发送。 |
 | `active_reply_enabled` | bool | `true` | 是否启用未被点名时的智能主动回复。 |
 | `active_reply_cooldown_sec` | int | `30` | 同一会话内主动回复冷却时间，避免连续抢话。 |
-| `natural_chat_style_enabled` | bool | `true` | 是否在插件触发或原生点名回复中追加自然群聊风格约束。日常聊天可短段分段，列表、步骤、总结、配置说明时收束成紧凑回答。 |
+| `natural_chat_style_enabled` | bool | `true` | 是否在插件触发或原生点名回复中追加自然群聊风格约束。日常聊天由模型按语气自行判断是否短段分段，列表、步骤、总结、配置说明时收束成紧凑回答。 |
+| `smart_segment_enabled` | bool | `true` | AstrBot 全局分段关闭时，是否由插件接管日常聊天回复的自然分段发送。 |
+| `smart_segment_use_model` | bool | `true` | 是否调用内部智能模型分析自然分段；已配置自定义内部模型时优先使用自定义接口，否则使用当前会话模型，失败时退回本地分段。 |
+| `smart_segment_respect_astrbot` | bool | `true` | AstrBot 自带分段已启用时，插件是否避让以免重复分段。 |
+| `smart_segment_interval_sec` | float | `0.8` | 插件接管分段发送时，多条消息之间的基础间隔秒数。 |
 | `action_output_enabled` | bool | `false` | 是否允许括号动作描写、舞台旁白以及耳朵/尾巴/爪爪等动作输出；默认关闭。 |
-| `natural_chat_max_sentences` | int | `3` | 自然群聊风格约束下日常聊天默认使用的最大短段/短句分段数。 |
+| `natural_chat_max_sentences` | int | `3` | 自然分段安全上限。模型自行判断分成几条，此项只限制最多短段/短句数量，避免刷屏。 |
 | `followup_reply_window_sec` | int | `180` | 小昭刚回复某人后，同一群同一人未点名但继续追问时的续聊窗口；设为 `0` 可关闭。 |
 | `active_judge_attempt_cooldown_sec` | int | `45` | 无关键词主动回复判定尝试冷却时间；无论最后是否回复，都避免每条普通消息都请求模型判定。 |
 | `judge_failure_backoff_sec` | int | `120` | 智能判定模型超时、429 或其他失败后的熔断时间；熔断期间跳过智能判定，但不会拦截明确的规则点名回复。 |
@@ -102,6 +112,17 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 "owner_ids": ["<your_user_id>"]
 ```
 
+如果希望插件的智能判断和自然分段使用单独模型，可以配置 OpenAI 兼容接口：
+
+```json
+"custom_ai_enabled": true,
+"custom_ai_api_base": "https://api.example.com/v1",
+"custom_ai_api_key": "<your_api_key>",
+"custom_ai_model": "your-model-name"
+```
+
+`custom_ai_api_base` 也可以直接填完整的 `https://api.example.com/v1/chat/completions`。请不要把真实 Key 提交到仓库。
+
 ## 回复策略
 
 ### 提到关键词时
@@ -110,10 +131,12 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 
 1. 明确“不用回复”“别理”等跳过表达，选择不回复。
 2. 明确叫机器人、问机器人、请求机器人帮忙，选择回复。
-3. 规则不确定时，如果 `use_llm_judge=true`，调用当前模型只输出 `REPLY` 或 `SKIP`。
+3. 规则不确定时，如果 `use_llm_judge=true`，调用内部智能模型只输出 `REPLY` 或 `SKIP`；配置了自定义内部模型时优先走自定义接口，否则使用当前 provider。
 4. 判定为 `REPLY` 时，把本轮消息标记为唤醒消息，交给 AstrBot 正常 LLM 流程生成回复。
 
-如果 `natural_chat_style_enabled=true`，插件会在本轮 LLM 请求里追加一段稳定的系统提醒：按实时群聊自然对话回复，日常聊天可用 `natural_chat_max_sentences` 指定数量内的短段/短句自然分段；列表、步骤、总结、配置说明时收束成一段紧凑的结构化回答，并且不要每句都抢答。`action_output_enabled=false` 时，插件还会在 LLM 回复后兜底清理常见括号动作描写，原生 @/引用机器人触发的群聊回复也会受这个开关影响。
+如果 `natural_chat_style_enabled=true`，插件会在本轮 LLM 请求里追加一段稳定的系统提醒：按实时群聊自然对话回复，日常聊天由模型按语气、停顿和信息密度自行判断是否拆成短段；`natural_chat_max_sentences` 只作为安全上限，避免刷屏。列表、步骤、总结、配置说明时收束成一段紧凑的结构化回答，并且不要每句都抢答。`action_output_enabled=false` 时，插件还会在 LLM 回复后兜底清理常见括号动作描写，原生 @/引用机器人触发的群聊回复也会受这个开关影响。
+
+如果 AstrBot 自带分段回复关闭，且 `smart_segment_enabled=true`，插件会在发送前对纯文本模型回复做一次分段判断：优先让内部智能模型输出 JSON 段落，段落数量由模型按自然语气决定，再把这些段落逐条发送；模型不可用或返回不合规时退回本地自然分段。为避免破坏信息密度，含代码、路径、配置、日志、列表、图片、文件等内容不会被插件强行拆开。AstrBot 自带分段已开启时，默认由 `smart_segment_respect_astrbot=true` 让插件避让框架分段。
 
 ### 主动回复时
 
@@ -173,6 +196,7 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 [xiaozhao_smart_mention] reply
 [xiaozhao_smart_mention] skip
 [xiaozhao_smart_mention] active reply
+[xiaozhao_smart_mention] smart segmented send
 ```
 
 这些日志可以用来确认插件是否正确判定了回复或跳过。
@@ -185,7 +209,7 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 - 确认 `mention_keywords` 中包含实际使用的名字；旧配置也可以继续使用 `aliases`。
 - 查看日志里是否出现 `skip`。
 - 如果规则不够，可开启 `use_llm_judge`。
-- 确认 AstrBot 当前 provider 可用，否则 LLM 判定会失败。
+- 确认自定义内部模型配置可用；未启用自定义模型时，确认 AstrBot 当前 provider 可用，否则 LLM 判定会失败。
 
 ### 小昭主动回复太频繁
 
