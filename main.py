@@ -69,6 +69,7 @@ CHAT_HEADING_PREFIX_RE = re.compile(
 )
 CHAT_BOLD_HEADING_PREFIX_RE = re.compile(r"^\s*\*{1,2}(?P<title>[^*\n]{1,40}?)\*{1,2}\s*")
 CHAT_SENTENCE_RE = re.compile(r"[^。！？!?…~～]+[。！？!?…~～]+(?:[❤️❤💕💖✨~～]*)|[^。！？!?…~～]+$")
+ISOLATED_PUNCTUATION_RE = re.compile(r"^[。！？!?，,、；;：:…~～—\-]+$")
 STRUCTURED_REPLY_MARKERS = (
     "```",
     "`",
@@ -322,7 +323,8 @@ def _is_structured_or_technical_reply(text: str) -> bool:
 
 def _natural_local_segments(text: str, max_segments: int) -> list[str]:
     max_segments = max(1, max_segments)
-    formatted = _format_natural_chat_paragraphs(text, max_segments)
+    target_segments = _natural_segment_target_limit(text, max_segments)
+    formatted = _format_natural_chat_paragraphs(text, target_segments)
     segments = [
         segment.strip()
         for segment in re.split(r"\n{2,}", formatted)
@@ -330,9 +332,56 @@ def _natural_local_segments(text: str, max_segments: int) -> list[str]:
     ]
     if not segments and text.strip():
         segments = [text.strip()]
+    segments = _merge_chat_segments_to_limit(segments, target_segments)
     if len(segments) > max_segments:
         segments = segments[: max_segments - 1] + ["".join(segments[max_segments - 1 :])]
     return segments
+
+
+def _natural_segment_target_limit(text: str, hard_limit: int) -> int:
+    hard_limit = max(1, hard_limit)
+    if hard_limit <= 3:
+        return hard_limit
+
+    compact_len = len(_normalise_segment_text(text))
+    if compact_len < 260:
+        target = 3
+    elif compact_len < 480:
+        target = 4
+    else:
+        target = 5
+    return min(hard_limit, target)
+
+
+def _merge_chat_segments_to_limit(segments: list[str], limit: int) -> list[str]:
+    limit = max(1, limit)
+    merged = _absorb_isolated_punctuation_segments(segments)
+    while len(merged) > limit:
+        candidate_indexes = range(1, len(merged) - 1) if len(merged) > 2 and len(merged[0]) <= 18 else range(len(merged) - 1)
+        pair_index = min(candidate_indexes, key=lambda index: len(merged[index]) + len(merged[index + 1]))
+        merged[pair_index : pair_index + 2] = [
+            merged[pair_index] + merged[pair_index + 1],
+        ]
+    return merged
+
+
+def _absorb_isolated_punctuation_segments(segments: list[str]) -> list[str]:
+    merged: list[str] = []
+    for raw_segment in segments:
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        if ISOLATED_PUNCTUATION_RE.fullmatch(segment):
+            if merged:
+                merged[-1] += segment
+            else:
+                merged.append(segment)
+            continue
+        if merged and ISOLATED_PUNCTUATION_RE.fullmatch(merged[-1]):
+            merged[-1] += segment
+            continue
+        merged.append(segment)
+    return merged
 
 
 def _extract_segment_json(text: str) -> dict | None:
@@ -369,6 +418,11 @@ def _normalise_model_segments(original: str, raw: str, max_segments: int) -> lis
         for segment in raw_segments
         if isinstance(segment, str) and segment.strip()
     )
+    segments = _absorb_isolated_punctuation_segments(segments)
+    if not _are_usable_segments(original, segments, max_segments):
+        return None
+    target_segments = _natural_segment_target_limit(original, max_segments)
+    segments = _merge_chat_segments_to_limit(segments, target_segments)
     if not _are_usable_segments(original, segments, max_segments):
         return None
     return segments

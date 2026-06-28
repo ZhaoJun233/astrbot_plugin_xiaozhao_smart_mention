@@ -932,6 +932,47 @@ class DirectedReplyGuardTest(unittest.TestCase):
             ["这事确实有点无聊。", "主人可以先休息一下。"],
         )
 
+    def test_model_segments_absorb_isolated_punctuation(self) -> None:
+        original = "小昭在呢。主人别急，我慢慢听你说。"
+        raw = '{"segments":["小昭在呢","。","主人别急，我慢慢听你说。"]}'
+
+        self.assertEqual(
+            _normalise_model_segments(original, raw, 5),
+            ["小昭在呢。", "主人别急，我慢慢听你说。"],
+        )
+
+    def test_model_segments_absorb_leading_punctuation(self) -> None:
+        original = "。小昭在呢，主人别急。后面慢慢说。"
+        raw = '{"segments":["。","小昭在呢，主人别急。","后面慢慢说。"]}'
+
+        self.assertEqual(
+            _normalise_model_segments(original, raw, 5),
+            ["。小昭在呢，主人别急。", "后面慢慢说。"],
+        )
+
+    def test_high_configured_limit_is_only_a_safety_cap(self) -> None:
+        original = (
+            "小昭就是一直陪在主人身边的聊天助手。"
+            "平时可以陪主人闲聊，也可以帮忙看日志、改插件、整理配置。"
+            "如果群里话题比较散，小昭会尽量接得轻一点，不把每句话都说成正式报告。"
+            "主人需要的时候叫一声就好。"
+        )
+        raw = (
+            '{"segments":['
+            '"小昭就是一直陪在主人身边的聊天助手。",'
+            '"平时可以陪主人闲聊，",'
+            '"也可以帮忙看日志、改插件、整理配置。",'
+            '"如果群里话题比较散，",'
+            '"小昭会尽量接得轻一点，不把每句话都说成正式报告。",'
+            '"主人需要的时候叫一声就好。"]}'
+        )
+
+        segments = _normalise_model_segments(original, raw, 6)
+
+        self.assertIsNotNone(segments)
+        self.assertLessEqual(len(segments), 3)
+        self.assertEqual("".join(segments), original)
+
     def test_llm_response_cleanup_removes_chatty_heading(self) -> None:
         class Response:
             completion_text = "### 小昭评价\n\n这事确实有点无聊。主人可以先休息一下。"
