@@ -321,6 +321,33 @@ def _is_structured_or_technical_reply(text: str) -> bool:
     return False
 
 
+def _is_technical_or_code_reply(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if any(marker in stripped for marker in ("```", "`", "http://", "https://", "D:\\", "/AstrBot/")):
+        return True
+    if "|" in stripped and "\n" in stripped:
+        return True
+    if re.search(r"(Traceback|Exception|Error:|\[[A-Z]+\]|\w+Error\b)", stripped):
+        return True
+    if re.search(r"(?m)^\s*(?:python|pip|docker|git|npm|pnpm|yarn|cd|cat|tail)\s+", stripped):
+        return True
+    if any(keyword in stripped for keyword in TECHNICAL_REPLY_KEYWORDS):
+        return True
+    return False
+
+
+def _looks_like_casual_numbered_list(text: str) -> bool:
+    stripped = text.strip()
+    if _is_technical_or_code_reply(stripped):
+        return False
+    numbered_items = re.findall(r"(?m)^\s*\d+[.、]\s+", stripped)
+    if len(numbered_items) < 2:
+        return False
+    return not re.search(r"(?m)^\s*(?:[-*]|\d+[.、])\s+`", stripped)
+
+
 def _natural_local_segments(text: str, max_segments: int) -> list[str]:
     max_segments = max(1, max_segments)
     target_segments = _natural_segment_target_limit(text, max_segments)
@@ -336,6 +363,13 @@ def _natural_local_segments(text: str, max_segments: int) -> list[str]:
     if len(segments) > max_segments:
         segments = segments[: max_segments - 1] + ["".join(segments[max_segments - 1 :])]
     return segments
+
+
+def _casual_numbered_list_segments(text: str, max_segments: int) -> list[str]:
+    parts = [part.strip() for part in re.split(r"\n{2,}", text.strip()) if part.strip()]
+    if len(parts) < 2:
+        return _natural_local_segments(text, max_segments)
+    return _merge_chat_segments_to_limit(parts, _natural_segment_target_limit(text, max_segments))
 
 
 def _natural_segment_target_limit(text: str, hard_limit: int) -> int:
@@ -1111,10 +1145,13 @@ class Main(Star):
             return
 
         text = plain.strip()
-        if len(text) < 45 or _is_structured_or_technical_reply(text):
+        if len(text) < 45 or _is_technical_or_code_reply(text):
             return
+        if _looks_like_casual_numbered_list(text):
+            segments = _casual_numbered_list_segments(text, self.natural_chat_max_sentences)
+        else:
+            segments = await self._build_natural_segments(event, text)
 
-        segments = await self._build_natural_segments(event, text)
         if len(segments) < 2:
             return
 

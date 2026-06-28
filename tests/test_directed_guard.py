@@ -1147,6 +1147,32 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertEqual(event.sent_messages, [])
         self.assertEqual(provider.calls, [])
 
+    def test_group_casual_numbered_advice_list_is_segmented(self) -> None:
+        provider = FakeProvider('{"segments":["不应该调用模型"]}')
+        plugin = build_plugin({"smart_segment_interval_sec": 0})
+        plugin.context = FakeContext(provider)
+        event = FakeEvent(group_id="group-a", sender_id="user-a")
+        event.result = FakeResult(
+            [
+                Plain(
+                    "分享一下小昭知道的几个实用思路喵～\n\n"
+                    "1. 别太客气但也别太随便：室友之间要分东西先说一声，用完还回来。\n\n"
+                    "2. 有矛盾当场说清楚：忍到爆发最伤关系，语气软一点但把问题摆出来。\n\n"
+                    "3. 偶尔一起做点事：一起点个外卖、打把游戏，关系会自然近一些。\n\n"
+                    "你室友是做啥让你烦的事了喵？",
+                ),
+            ],
+        )
+
+        asyncio.run(plugin.send_natural_segments(event))
+
+        self.assertIsNone(event.result)
+        self.assertGreaterEqual(len(event.sent_messages), 2)
+        sent_texts = [msg.chain[0].text for msg in event.sent_messages]
+        self.assertIn("分享一下小昭知道的几个实用思路喵～", sent_texts[0])
+        self.assertTrue(any("1. 别太客气" in text for text in sent_texts))
+        self.assertEqual(provider.calls, [])
+
     def test_slow_model_segment_quickly_falls_back_to_local_segments(self) -> None:
         provider = FakeProvider('{"segments":["不应该调用"]}', delay=0.2)
         plugin = build_plugin(
