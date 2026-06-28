@@ -61,6 +61,13 @@ ACTION_OUTPUT_KEYWORDS = (
     "清了清嗓子",
 )
 ACTION_PARENS_RE = re.compile(r"[（(]([^（）()]{1,120})[）)]")
+ACTION_MARKDOWN_RE = re.compile(r"(?<!\*)\*([^*\n]{1,120})\*(?!\*)")
+MARKDOWN_EMPHASIS_RE = re.compile(r"(?<!\*)\*{1,2}([^*\n]{1,240}?)\*{1,2}(?!\*)")
+MARKDOWN_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*(?P<title>[^\n]{1,40})\s*(?:\n+|$)")
+CHAT_HEADING_PREFIX_RE = re.compile(
+    r"^\s*(?P<title>[^。\n！？!?]{1,30}(?:评价|看法|分析|总结|回复|说明|建议|吐槽|结论|回答|判断))[:：]?\s*",
+)
+CHAT_BOLD_HEADING_PREFIX_RE = re.compile(r"^\s*\*{1,2}(?P<title>[^*\n]{1,40}?)\*{1,2}\s*")
 CHAT_SENTENCE_RE = re.compile(r"[^。！？!?…~～]+[。！？!?…~～]+(?:[❤️❤💕💖✨~～]*)|[^。！？!?…~～]+$")
 STRUCTURED_REPLY_MARKERS = (
     "```",
@@ -184,9 +191,58 @@ def _strip_character_action_output(text: str) -> str:
         return match.group(0)
 
     cleaned = ACTION_PARENS_RE.sub(replace_action, text)
+    cleaned = ACTION_MARKDOWN_RE.sub(replace_action, cleaned)
     cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r" {2,}", " ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
+
+
+def _strip_chatty_heading_output(text: str) -> str:
+    stripped = (text or "").strip()
+    if not stripped or _is_structured_or_technical_reply(stripped):
+        return stripped
+
+    markdown_match = MARKDOWN_HEADING_RE.match(stripped)
+    if markdown_match:
+        remainder = stripped[markdown_match.end() :].strip()
+        if remainder and not _is_structured_or_technical_reply(remainder):
+            return remainder
+
+    lines = stripped.splitlines()
+    if len(lines) >= 2:
+        first = _strip_markdown_emphasis(lines[0]).strip()
+        remainder = "\n".join(lines[1:]).strip()
+        if _looks_like_chatty_heading(first) and remainder and not _is_structured_or_technical_reply(remainder):
+            return remainder
+
+    bold_match = CHAT_BOLD_HEADING_PREFIX_RE.match(stripped)
+    if bold_match and _looks_like_chatty_heading(bold_match.group("title")):
+        remainder = stripped[bold_match.end() :].strip()
+        if remainder and not _is_structured_or_technical_reply(remainder):
+            return remainder
+
+    prefix_match = CHAT_HEADING_PREFIX_RE.match(stripped)
+    if prefix_match and _looks_like_chatty_heading(prefix_match.group("title")):
+        remainder = stripped[prefix_match.end() :].strip()
+        if remainder and not _is_structured_or_technical_reply(remainder):
+            return remainder
+
+    return stripped
+
+
+def _looks_like_chatty_heading(title: str) -> bool:
+    clean = _strip_markdown_emphasis(title).strip(" #：:")
+    if not clean or len(clean) > 30:
+        return False
+    if any(keyword in clean for keyword in ("配置", "路径", "命令", "日志", "报错", "验证", "代码")):
+        return False
+    if re.search(r"[。！？!?\n`|]", clean):
+        return False
+    return bool(
+        clean.startswith(("小昭", "回复", "回答", "总结", "评价", "看法", "建议", "分析", "结论", "吐槽"))
+        or clean.endswith(("评价", "看法", "建议", "分析", "总结", "回复", "回答", "结论", "吐槽"))
+    )
 
 
 def _format_natural_chat_paragraphs(text: str, max_paragraphs: int = 3) -> str:
@@ -332,7 +388,18 @@ def _are_usable_segments(original: str, segments: list[str], max_segments: int) 
 
 
 def _normalise_segment_text(text: str) -> str:
-    return re.sub(r"\s+", "", text or "")
+    text = _strip_markdown_emphasis(text or "")
+    text = _strip_chatty_heading_output(text)
+    return re.sub(r"\s+", "", text)
+
+
+def _strip_markdown_emphasis(text: str) -> str:
+    previous = None
+    current = text
+    while previous != current:
+        previous = current
+        current = MARKDOWN_EMPHASIS_RE.sub(r"\1", current)
+    return current
 
 
 def _normalise_chat_completions_url(api_base: str) -> str:
@@ -484,6 +551,17 @@ class Main(Star):
         )
         self.smart_segment_use_model = bool(
             self.config.get("smart_segment_use_model", True),
+        )
+        self.natural_rewrite_use_model = bool(
+            self.config.get("natural_rewrite_use_model", False),
+        )
+        self.natural_rewrite_timeout_sec = max(
+            0.1,
+            _as_float(self.config.get("natural_rewrite_timeout_sec"), 1.2),
+        )
+        self.smart_segment_model_timeout_sec = max(
+            0.1,
+            _as_float(self.config.get("smart_segment_model_timeout_sec"), 2.0),
         )
         self.smart_segment_respect_astrbot = bool(
             self.config.get("smart_segment_respect_astrbot", True),
@@ -829,6 +907,7 @@ class Main(Star):
             f"确实需要分段时最多 {self.natural_chat_max_sentences} 个很短的聊天段落/短句，"
             "不要为了凑数量而拆分；像真人顺手回几句，不要写成长篇正式问答。"
             "遇到列表、步骤、总结、配置说明时，收束成一段紧凑的结构化回答。"
+            "日常聊天不要写标题、小标题、加粗标题或 Markdown 报告格式。"
             "不要每句都抢答，只在当前话题需要时简短接话。"
         )
         if not self.action_output_enabled:
@@ -848,7 +927,14 @@ class Main(Star):
         text = getattr(resp, "completion_text", "") or ""
         cleaned = _strip_character_action_output(text)
         if self.natural_chat_style_enabled:
+            cleaned = _strip_chatty_heading_output(cleaned)
+        if self.natural_chat_style_enabled and self.natural_rewrite_use_model:
             cleaned = await self._rewrite_reply_naturally(event, cleaned)
+        elif self.natural_chat_style_enabled:
+            cleaned = _format_natural_chat_paragraphs(
+                cleaned,
+                self.natural_chat_max_sentences,
+            )
         if cleaned == text:
             return
 
@@ -933,7 +1019,8 @@ class Main(Star):
             "2. 如果是日常聊天，按语气和停顿自行判断是否拆成多个自然短段，每段之间用一个空行。\n"
             f"3. 不要为了凑数量而拆分；确实需要分段时最多 {self.natural_chat_max_sentences} 段。\n"
             "4. 如果是技术、配置、列表、代码或命令说明，保持结构清晰，不要乱拆。\n"
-            "5. 只输出整理后的回复正文，不要解释。\n\n"
+            "5. 日常聊天删掉标题、小标题、加粗标题和 Markdown 报告格式，像直接发消息。\n"
+            "6. 只输出整理后的回复正文，不要解释。\n\n"
             f"原回复：\n{text}"
         )
         try:
@@ -941,7 +1028,7 @@ class Main(Star):
                 event,
                 prompt=prompt,
                 system_prompt="你是回复格式整理器，只调整格式和删除括号动作描写，不改意思。",
-                timeout=min(self.judge_timeout_sec, 5),
+                timeout=min(self.judge_timeout_sec, self.natural_rewrite_timeout_sec),
             )
         except Exception as exc:
             logger.debug(
@@ -1061,6 +1148,7 @@ class Main(Star):
         prompt = (
             "请把下面这条聊天回复切成更自然的多条即时聊天消息。\n"
             "只调整分段，不改原意，不新增信息，不改变称呼和语气。\n"
+            "去掉 Markdown 强调星号、标题、小标题、项目符号外壳和动作描写符号，让每条消息像直接聊天发送。\n"
             "由你根据真实聊天语气、停顿和信息密度判断应该分成几条；不要固定段数，也不要为了拆而拆。\n"
             "如果它更适合一条消息，返回 split=false。\n"
             f"为避免刷屏，确实需要拆分时最多 {self.natural_chat_max_sentences} 条。\n\n"
@@ -1075,9 +1163,9 @@ class Main(Star):
                     '{"split": true, "segments": ["第一段", "第二段"]}。'
                     "segments 数量由自然语气决定，不固定；更适合一条时输出 "
                     '{"split": false, "segments": []}。'
-                    "不要输出解释、Markdown 或代码块。"
+                    "不要输出解释、Markdown、星号强调、标题、小标题、动作描写或代码块。"
                 ),
-                timeout=min(self.judge_timeout_sec, 5),
+                timeout=min(self.judge_timeout_sec, self.smart_segment_model_timeout_sec),
             )
         except Exception as exc:
             logger.debug(

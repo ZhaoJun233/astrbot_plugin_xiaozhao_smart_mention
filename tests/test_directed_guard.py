@@ -305,12 +305,15 @@ async def _return_conversation(event):
 
 
 class FakeProvider:
-    def __init__(self, completion_text: str) -> None:
+    def __init__(self, completion_text: str, *, delay: float = 0.0) -> None:
         self.completion_text = completion_text
+        self.delay = delay
         self.calls = []
 
     async def text_chat(self, **kwargs):
         self.calls.append(kwargs)
+        if self.delay > 0:
+            await asyncio.sleep(self.delay)
         return types.SimpleNamespace(completion_text=self.completion_text)
 
 
@@ -828,6 +831,10 @@ class DirectedReplyGuardTest(unittest.TestCase):
             _strip_character_action_output("这个参数（默认 30 秒）可以调大一点。"),
             "这个参数（默认 30 秒）可以调大一点。",
         )
+        self.assertEqual(
+            _strip_character_action_output("*尾巴轻轻晃了晃* 好呀，小昭在呢。"),
+            "好呀，小昭在呢。",
+        )
 
     def test_llm_response_action_cleanup_can_be_disabled(self) -> None:
         class Response:
@@ -907,6 +914,36 @@ class DirectedReplyGuardTest(unittest.TestCase):
 
         self.assertIsNone(_normalise_model_segments(original, raw, 5))
 
+    def test_model_segments_can_remove_markdown_emphasis_stars(self) -> None:
+        original = "**小昭在呢。**主人别急，我慢慢听你说。"
+        raw = '{"segments":["小昭在呢。","主人别急，我慢慢听你说。"]}'
+
+        self.assertEqual(
+            _normalise_model_segments(original, raw, 5),
+            ["小昭在呢。", "主人别急，我慢慢听你说。"],
+        )
+
+    def test_model_segments_can_drop_chatty_markdown_heading(self) -> None:
+        original = "### 小昭评价\n\n这事确实有点无聊。主人可以先休息一下。"
+        raw = '{"segments":["这事确实有点无聊。","主人可以先休息一下。"]}'
+
+        self.assertEqual(
+            _normalise_model_segments(original, raw, 5),
+            ["这事确实有点无聊。", "主人可以先休息一下。"],
+        )
+
+    def test_llm_response_cleanup_removes_chatty_heading(self) -> None:
+        class Response:
+            completion_text = "### 小昭评价\n\n这事确实有点无聊。主人可以先休息一下。"
+
+        plugin = build_plugin({})
+        event = FakeEvent(group_id="private-a", sender_id="user-a")
+        resp = Response()
+
+        asyncio.run(plugin.clean_llm_response_actions(event, resp))
+
+        self.assertEqual(resp.completion_text, "这事确实有点无聊。主人可以先休息一下。")
+
     def test_structured_or_technical_reply_is_not_auto_split(self) -> None:
         text = (
             "配置检查结果：`action_output_enabled=False`，`natural_chat_style_enabled=True`，"
@@ -945,14 +982,32 @@ class DirectedReplyGuardTest(unittest.TestCase):
                 "\n\n主人尽管放心，小昭随时在线，不会掉链子的喵～❤️"
             )
 
-        provider = FakeProvider(
+        plugin = build_plugin({})
+        provider = FakeProvider("不应该调用")
+        plugin.context = FakeContext(provider)
+        event = FakeEvent(group_id="private-a", sender_id="user-a")
+        resp = Response()
+
+        asyncio.run(plugin.clean_llm_response_actions(event, resp))
+
+        self.assertEqual(provider.calls, [])
+        self.assertNotIn("（", resp.completion_text)
+        self.assertNotIn("眼睛亮晶晶", resp.completion_text)
+        self.assertIn("\n\n", resp.completion_text)
+        self.assertEqual(
+            resp.completion_text,
             (
-                "收到测试信号喵～！\n\n"
-                "小昭状态报告：系统正常、护主模块待命中、可爱值满格！\n\n"
+                "收到测试信号喵～！小昭状态报告：系统正常、动作括号运行稳定、护主模块待命中、可爱值满格！\n\n"
                 "主人尽管放心，小昭随时在线，不会掉链子的喵～❤️"
             ),
         )
-        plugin = build_plugin({})
+
+    def test_model_rewrite_is_opt_in(self) -> None:
+        class Response:
+            completion_text = "收到测试信号喵～！小昭状态报告：系统正常。（眼睛亮晶晶地看着主人）"
+
+        provider = FakeProvider("收到测试信号喵～！\n\n小昭状态报告：系统正常。")
+        plugin = build_plugin({"natural_rewrite_use_model": True})
         plugin.context = FakeContext(provider)
         event = FakeEvent(group_id="private-a", sender_id="user-a")
         resp = Response()
@@ -961,17 +1016,7 @@ class DirectedReplyGuardTest(unittest.TestCase):
 
         self.assertEqual(len(provider.calls), 1)
         self.assertIn("只调整格式", provider.calls[0]["system_prompt"])
-        self.assertNotIn("（", resp.completion_text)
-        self.assertNotIn("眼睛亮晶晶", resp.completion_text)
-        self.assertIn("\n\n", resp.completion_text)
-        self.assertEqual(
-            resp.completion_text,
-            (
-                "收到测试信号喵～！\n\n"
-                "小昭状态报告：系统正常、护主模块待命中、可爱值满格！\n\n"
-                "主人尽管放心，小昭随时在线，不会掉链子的喵～❤️"
-            ),
-        )
+        self.assertEqual(resp.completion_text, "收到测试信号喵～！\n\n小昭状态报告：系统正常。")
 
     def test_real_test_reply_falls_back_to_local_formatting_without_provider(self) -> None:
         class Response:
@@ -1060,6 +1105,33 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertIsNotNone(event.result)
         self.assertEqual(event.sent_messages, [])
         self.assertEqual(provider.calls, [])
+
+    def test_slow_model_segment_quickly_falls_back_to_local_segments(self) -> None:
+        provider = FakeProvider('{"segments":["不应该调用"]}', delay=0.2)
+        plugin = build_plugin(
+            {
+                "smart_segment_interval_sec": 0,
+                "smart_segment_model_timeout_sec": 0.1,
+            },
+        )
+        plugin.context = FakeContext(provider)
+        event = FakeEvent(group_id="private-a", sender_id="user-a")
+        event.result = FakeResult(
+            [
+                Plain(
+                    "收到测试信号喵～！小昭状态正常，可爱值也在线，刚刚那次调用没有掉线。主人还想测什么，小昭继续陪着。",
+                ),
+            ],
+        )
+
+        started = monotonic()
+        asyncio.run(plugin.send_natural_segments(event))
+        elapsed = monotonic() - started
+
+        self.assertLess(elapsed, 0.18)
+        self.assertIsNone(event.result)
+        self.assertGreaterEqual(len(event.sent_messages), 2)
+        self.assertEqual(len(provider.calls), 1)
 
     def test_natural_chat_style_prefers_short_chat_segments(self) -> None:
         plugin = build_plugin({})

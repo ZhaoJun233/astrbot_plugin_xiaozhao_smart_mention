@@ -61,9 +61,27 @@
   },
   "smart_segment_use_model": {
     "description": "使用内部智能模型分析分段",
-    "hint": "开启后使用插件内部智能模型输出自然分段 JSON；如已配置自定义内部模型则优先使用自定义接口，否则使用当前会话模型。模型不可用或返回不合规时退回本地自然分段。",
+    "hint": "开启后使用插件内部智能模型输出自然分段 JSON；如已配置自定义内部模型则优先使用自定义接口，否则使用当前会话模型。模型不可用、超时或返回不合规时退回本地自然分段。",
     "type": "bool",
     "default": true
+  },
+  "smart_segment_model_timeout_sec": {
+    "description": "分段模型超时（秒）",
+    "hint": "插件智能分段单次模型分析最多等待多久；超时后直接使用本地分段，避免回复明显变慢。",
+    "type": "float",
+    "default": 2.0
+  },
+  "natural_rewrite_use_model": {
+    "description": "使用模型自然改写",
+    "hint": "开启后会在回复生成后再调用一次内部智能模型做自然化整理，效果更细但会增加一次模型等待。默认关闭，仅用本地规则清理动作描写、标题和基础分段。",
+    "type": "bool",
+    "default": false
+  },
+  "natural_rewrite_timeout_sec": {
+    "description": "自然改写模型超时（秒）",
+    "hint": "仅在使用模型自然改写时生效。超时后退回本地清理结果。",
+    "type": "float",
+    "default": 1.2
   },
   "smart_segment_respect_astrbot": {
     "description": "避让 AstrBot 全局分段",

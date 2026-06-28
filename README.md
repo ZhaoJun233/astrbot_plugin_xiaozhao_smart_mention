@@ -73,7 +73,7 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 | --- | --- | --- | --- |
 | `use_llm_judge` | bool | `true` | 规则无法明确判断时，调用当前模型判断是否回复。 |
 | `judge_timeout_sec` | int | `8` | 智能判定模型调用超时时间，单位秒。 |
-| `custom_ai_enabled` | bool | `false` | 是否启用自定义内部智能模型。开启后，提及判定、主动回复判定、自然改写和智能分段优先调用自定义 OpenAI 兼容接口。 |
+| `custom_ai_enabled` | bool | `false` | 是否启用自定义内部智能模型。开启后，提及判定、主动回复判定、智能分段，以及显式开启的自然改写会优先调用自定义 OpenAI 兼容接口。 |
 | `custom_ai_api_base` | string | `""` | 自定义模型 API URL，可填 `https://example.com/v1`，也可填完整 `/chat/completions` 地址。 |
 | `custom_ai_api_key` | string | `""` | 自定义模型 API Key。本地代理不需要鉴权时可留空。 |
 | `custom_ai_model` | string | `""` | 自定义模型名，会作为 OpenAI 兼容接口的 `model` 字段发送。 |
@@ -81,7 +81,10 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 | `active_reply_cooldown_sec` | int | `30` | 同一会话内主动回复冷却时间，避免连续抢话。 |
 | `natural_chat_style_enabled` | bool | `true` | 是否在插件触发或原生点名回复中追加自然群聊风格约束。日常聊天由模型按语气自行判断是否短段分段，列表、步骤、总结、配置说明时收束成紧凑回答。 |
 | `smart_segment_enabled` | bool | `true` | AstrBot 全局分段关闭时，是否由插件接管日常聊天回复的自然分段发送。 |
-| `smart_segment_use_model` | bool | `true` | 是否调用内部智能模型分析自然分段；已配置自定义内部模型时优先使用自定义接口，否则使用当前会话模型，失败时退回本地分段。 |
+| `smart_segment_use_model` | bool | `true` | 是否调用内部智能模型分析自然分段；已配置自定义内部模型时优先使用自定义接口，否则使用当前会话模型，失败、超时或返回不合规时退回本地分段。 |
+| `smart_segment_model_timeout_sec` | float | `2.0` | 智能分段模型最多等待秒数，超时后直接走本地分段，避免回复明显变慢。 |
+| `natural_rewrite_use_model` | bool | `false` | 是否在回复生成后额外调用一次内部智能模型做自然化整理。默认关闭，只用本地规则清理动作描写、标题和基础分段；开启后效果更细，但会增加一次模型等待。 |
+| `natural_rewrite_timeout_sec` | float | `1.2` | 自然改写模型最多等待秒数，仅在 `natural_rewrite_use_model=true` 时生效。 |
 | `smart_segment_respect_astrbot` | bool | `true` | AstrBot 自带分段已启用时，插件是否避让以免重复分段。 |
 | `smart_segment_interval_sec` | float | `0.8` | 插件接管分段发送时，多条消息之间的基础间隔秒数。 |
 | `action_output_enabled` | bool | `false` | 是否允许括号动作描写、舞台旁白以及耳朵/尾巴/爪爪等动作输出；默认关闭。 |
@@ -134,9 +137,9 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 3. 规则不确定时，如果 `use_llm_judge=true`，调用内部智能模型只输出 `REPLY` 或 `SKIP`；配置了自定义内部模型时优先走自定义接口，否则使用当前 provider。
 4. 判定为 `REPLY` 时，把本轮消息标记为唤醒消息，交给 AstrBot 正常 LLM 流程生成回复。
 
-如果 `natural_chat_style_enabled=true`，插件会在本轮 LLM 请求里追加一段稳定的系统提醒：按实时群聊自然对话回复，日常聊天由模型按语气、停顿和信息密度自行判断是否拆成短段；`natural_chat_max_sentences` 只作为安全上限，避免刷屏。列表、步骤、总结、配置说明时收束成一段紧凑的结构化回答，并且不要每句都抢答。`action_output_enabled=false` 时，插件还会在 LLM 回复后兜底清理常见括号动作描写，原生 @/引用机器人触发的群聊回复也会受这个开关影响。
+如果 `natural_chat_style_enabled=true`，插件会在本轮 LLM 请求里追加一段稳定的系统提醒：按实时群聊自然对话回复，日常聊天由模型按语气、停顿和信息密度自行判断是否拆成短段；`natural_chat_max_sentences` 只作为安全上限，避免刷屏。列表、步骤、总结、配置说明时收束成一段紧凑的结构化回答，并且不要每句都抢答。`action_output_enabled=false` 时，插件还会在 LLM 回复后用本地规则兜底清理常见括号动作描写、日常聊天标题和基础短段格式，原生 @/引用机器人触发的群聊回复也会受这个开关影响。默认不会为了自然化整理再额外调用一次模型；只有 `natural_rewrite_use_model=true` 时才会启用模型自然改写。
 
-如果 AstrBot 自带分段回复关闭，且 `smart_segment_enabled=true`，插件会在发送前对纯文本模型回复做一次分段判断：优先让内部智能模型输出 JSON 段落，段落数量由模型按自然语气决定，再把这些段落逐条发送；模型不可用或返回不合规时退回本地自然分段。为避免破坏信息密度，含代码、路径、配置、日志、列表、图片、文件等内容不会被插件强行拆开。AstrBot 自带分段已开启时，默认由 `smart_segment_respect_astrbot=true` 让插件避让框架分段。
+如果 AstrBot 自带分段回复关闭，且 `smart_segment_enabled=true`，插件会在发送前对纯文本模型回复做一次分段判断：优先让内部智能模型输出 JSON 段落，段落数量由模型按自然语气决定，再把这些段落逐条发送；模型不可用、超时或返回不合规时退回本地自然分段。为避免破坏信息密度，含代码、路径、配置、日志、列表、图片、文件等内容不会被插件强行拆开。AstrBot 自带分段已开启时，默认由 `smart_segment_respect_astrbot=true` 让插件避让框架分段。
 
 ### 主动回复时
 
