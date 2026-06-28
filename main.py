@@ -19,6 +19,40 @@ PLUGIN_TAG = "[xiaozhao_smart_mention]"
 EXTRA_DECISION = "xiaozhao_smart_mention_decision"
 EXTRA_REASON = "xiaozhao_smart_mention_reason"
 EXTRA_MODE = "xiaozhao_smart_mention_mode"
+ACTION_OUTPUT_KEYWORDS = (
+    "动作",
+    "舞台",
+    "旁白",
+    "耳朵",
+    "猫耳",
+    "尾巴",
+    "爪",
+    "爪爪",
+    "歪头",
+    "歪着头",
+    "低头",
+    "抬头",
+    "点头",
+    "摇头",
+    "眨眼",
+    "眨眨眼",
+    "挠",
+    "捂",
+    "拍了拍",
+    "后退",
+    "跳到",
+    "探头",
+    "缩了缩",
+    "蹭",
+    "竖起",
+    "抖了抖",
+    "晃了晃",
+    "摆动",
+    "炸毛",
+    "脸红",
+    "清了清嗓子",
+)
+ACTION_PARENS_RE = re.compile(r"[（(]([^（）()]{1,120})[）)]")
 
 DEFAULT_MENTION_KEYWORDS = ["小昭", "小昭猫娘"]
 DEFAULT_ALIASES = DEFAULT_MENTION_KEYWORDS
@@ -91,6 +125,29 @@ def _as_int(value, fallback: int) -> int:
         return fallback
 
 
+def _looks_like_character_action(text: str) -> bool:
+    body = text.strip()
+    if not body:
+        return False
+    return any(keyword in body for keyword in ACTION_OUTPUT_KEYWORDS)
+
+
+def _strip_character_action_output(text: str) -> str:
+    if not text:
+        return text
+
+    def replace_action(match: re.Match[str]) -> str:
+        body = match.group(1)
+        if _looks_like_character_action(body):
+            return ""
+        return match.group(0)
+
+    cleaned = ACTION_PARENS_RE.sub(replace_action, text)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def _resolve_mention_keywords(config) -> list[str]:
     mention_keywords = _as_list(
         config.get("mention_keywords"),
@@ -161,9 +218,12 @@ class Main(Star):
         self.natural_chat_style_enabled = bool(
             self.config.get("natural_chat_style_enabled", True),
         )
+        self.action_output_enabled = bool(
+            self.config.get("action_output_enabled", False),
+        )
         self.natural_chat_max_sentences = max(
             1,
-            _as_int(self.config.get("natural_chat_max_sentences"), 2),
+            _as_int(self.config.get("natural_chat_max_sentences"), 3),
         )
         self.followup_reply_window_sec = _as_float(
             self.config.get("followup_reply_window_sec"),
@@ -443,15 +503,23 @@ class Main(Star):
         event: AstrMessageEvent,
         req: ProviderRequest,
     ) -> None:
-        if event.get_extra(EXTRA_DECISION) != "REPLY":
+        is_smart_reply = event.get_extra(EXTRA_DECISION) == "REPLY"
+        is_native_directed = self._has_native_directed_signal(event)
+        if not is_smart_reply and not is_native_directed:
             return
 
         self._remove_direct_send_tool(req)
 
         sender_name = event.get_sender_name() or "未知昵称"
         sender_id = event.get_sender_id() or "未知ID"
-        reason = event.get_extra(EXTRA_REASON, "smart_mention")
-        mode = event.get_extra(EXTRA_MODE, "mention")
+        reason = event.get_extra(
+            EXTRA_REASON,
+            "smart_mention" if is_smart_reply else "native_directed",
+        )
+        mode = event.get_extra(
+            EXTRA_MODE,
+            "mention" if is_smart_reply else "native_directed",
+        )
         trigger = (
             "群聊智能主动回复"
             if mode == "active_reply"
@@ -474,13 +542,42 @@ class Main(Star):
             return ""
 
         reminder = (
-            "按实时群聊的自然对话来回：不使用括号动作描写，不写舞台动作；"
-            f"默认 1-{self.natural_chat_max_sentences} 句，能一句说明白就别展开；"
-            "不要每句都抢答，只在当前话题需要时可简短接话。"
+            "按实时群聊的自然对话来回：日常接话可以用 "
+            f"1-{self.natural_chat_max_sentences} 个很短的聊天段落/短句分段，"
+            "像真人顺手回几句；不要写成长篇正式问答。"
+            "遇到列表、步骤、总结、配置说明时，收束成一段紧凑的结构化回答。"
+            "不要每句都抢答，只在当前话题需要时简短接话。"
         )
+        if not self.action_output_enabled:
+            reminder += (
+                "不要输出括号动作描写、舞台旁白或身体动作描述，"
+                "例如耳朵、尾巴、爪爪、歪头、捂嘴、后退等动作。"
+            )
         if mode == "active_reply":
             reminder += "本轮是主动回复，更要轻量接话、不抢话。"
         return reminder
+
+    @filter.on_llm_response(priority=80)
+    async def clean_llm_response_actions(self, event: AstrMessageEvent, resp) -> None:
+        if self.action_output_enabled:
+            return
+
+        get_message_type = getattr(event, "get_message_type", None)
+        if callable(get_message_type) and get_message_type() != MessageType.GROUP_MESSAGE:
+            return
+
+        text = getattr(resp, "completion_text", "") or ""
+        cleaned = _strip_character_action_output(text)
+        if cleaned == text:
+            return
+
+        resp.completion_text = cleaned or "嗯。"
+        logger.info(
+            "%s action output stripped: group=%s sender=%s",
+            PLUGIN_TAG,
+            event.get_group_id(),
+            event.get_sender_id(),
+        )
 
     def _remove_direct_send_tool(self, req: ProviderRequest) -> None:
         if req.func_tool is None:

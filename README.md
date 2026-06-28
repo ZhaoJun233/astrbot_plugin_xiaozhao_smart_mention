@@ -10,7 +10,7 @@
 - 支持短时间续聊：小昭刚回复某人后，同一人不再点名但继续追问时也能自然接上。
 - 自动读取 AstrBot 当前群聊上下文，辅助判断当前对话场景。
 - 对插件触发的回复追加系统提醒，让小昭自然回应，不解释触发机制，也不特意强调对方是不是主人。
-- 默认追加自然群聊风格约束：不使用括号动作描写或舞台动作，通常 1-2 句，必要时简短接话，不每句都抢答。
+- 默认追加自然群聊风格约束：日常聊天可用 1-3 个短段/短句自然分段；列表、步骤、总结、配置说明时收束成紧凑回答；默认关闭括号动作描写和舞台动作输出。
 - 原生 `@机器人`、回复机器人消息等场景会先经过防刷屏冷却，再交给 AstrBot 默认流程处理。
 - 主人 ID 可在插件配置里自定义；仓库默认不写入任何真实用户 ID。
 
@@ -73,8 +73,9 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 | `judge_timeout_sec` | int | `8` | 智能判定模型调用超时时间，单位秒。 |
 | `active_reply_enabled` | bool | `true` | 是否启用未被点名时的智能主动回复。 |
 | `active_reply_cooldown_sec` | int | `30` | 同一会话内主动回复冷却时间，避免连续抢话。 |
-| `natural_chat_style_enabled` | bool | `true` | 是否在插件触发的回复中追加自然群聊风格约束，避免括号动作描写、舞台动作和过度抢答。 |
-| `natural_chat_max_sentences` | int | `2` | 自然群聊风格约束下默认回复的最大句数；默认提示为 `1-2` 句。 |
+| `natural_chat_style_enabled` | bool | `true` | 是否在插件触发或原生点名回复中追加自然群聊风格约束。日常聊天可短段分段，列表、步骤、总结、配置说明时收束成紧凑回答。 |
+| `action_output_enabled` | bool | `false` | 是否允许括号动作描写、舞台旁白以及耳朵/尾巴/爪爪等动作输出；默认关闭。 |
+| `natural_chat_max_sentences` | int | `3` | 自然群聊风格约束下日常聊天默认使用的最大短段/短句分段数。 |
 | `followup_reply_window_sec` | int | `180` | 小昭刚回复某人后，同一群同一人未点名但继续追问时的续聊窗口；设为 `0` 可关闭。 |
 | `active_judge_attempt_cooldown_sec` | int | `45` | 无关键词主动回复判定尝试冷却时间；无论最后是否回复，都避免每条普通消息都请求模型判定。 |
 | `judge_failure_backoff_sec` | int | `120` | 智能判定模型超时、429 或其他失败后的熔断时间；熔断期间跳过智能判定，但不会拦截明确的规则点名回复。 |
@@ -112,7 +113,7 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 3. 规则不确定时，如果 `use_llm_judge=true`，调用当前模型只输出 `REPLY` 或 `SKIP`。
 4. 判定为 `REPLY` 时，把本轮消息标记为唤醒消息，交给 AstrBot 正常 LLM 流程生成回复。
 
-如果 `natural_chat_style_enabled=true`，插件会在本轮 LLM 请求里追加一段稳定的系统提醒：按实时群聊自然对话回复，不使用括号动作描写或舞台动作，默认控制在 `natural_chat_max_sentences` 指定的句数内，并且不要每句都抢答。
+如果 `natural_chat_style_enabled=true`，插件会在本轮 LLM 请求里追加一段稳定的系统提醒：按实时群聊自然对话回复，日常聊天可用 `natural_chat_max_sentences` 指定数量内的短段/短句自然分段；列表、步骤、总结、配置说明时收束成一段紧凑的结构化回答，并且不要每句都抢答。`action_output_enabled=false` 时，插件还会在 LLM 回复后兜底清理常见括号动作描写，原生 @/引用机器人触发的群聊回复也会受这个开关影响。
 
 ### 主动回复时
 

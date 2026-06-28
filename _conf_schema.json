@@ -25,15 +25,21 @@
   },
   "natural_chat_style_enabled": {
     "description": "自然群聊风格约束",
-    "hint": "插件触发回复时追加自然群聊风格提醒：不使用括号动作描写或舞台动作，默认简短接话，避免每句都抢答。",
+    "hint": "插件触发或原生点名回复时追加自然群聊风格提醒：日常聊天可短段分段，列表、步骤、总结、配置说明时收束成紧凑回答。",
     "type": "bool",
     "default": true
   },
+  "action_output_enabled": {
+    "description": "允许动作描写输出",
+    "hint": "是否允许输出括号动作描写、舞台旁白或耳朵/尾巴/爪爪等动作。默认关闭；需要角色扮演时可开启。",
+    "type": "bool",
+    "default": false
+  },
   "natural_chat_max_sentences": {
-    "description": "自然回复最大句数",
-    "hint": "自然群聊风格约束下默认回复的最大句数；建议保持 1 到 3，避免日常群聊里回复过长。",
+    "description": "自然回复最大短段数",
+    "hint": "自然群聊风格约束下日常聊天默认使用的最大短段/短句分段数；列表、步骤、总结、配置说明会收束成更紧凑的结构化回答。",
     "type": "int",
-    "default": 2
+    "default": 3
   },
   "followup_reply_window_sec": {
     "description": "续聊窗口（秒）",

@@ -53,6 +53,13 @@ def _install_astrbot_test_stubs() -> None:
 
             return decorator
 
+        @staticmethod
+        def on_llm_response(*args, **kwargs):
+            def decorator(func):
+                return func
+
+            return decorator
+
     api_event.AstrMessageEvent = AstrMessageEvent
     api_event.filter = _Filter
     sys.modules["astrbot.api.event"] = api_event
@@ -174,7 +181,14 @@ except ModuleNotFoundError:
     from astrbot.core.agent.tool import FunctionTool, ToolSet
     from astrbot.core.provider.entities import ProviderRequest
 
-from main import EXTRA_DECISION, EXTRA_REASON, Main, _format_exception, _stop_event_silently
+from main import (
+    EXTRA_DECISION,
+    EXTRA_REASON,
+    Main,
+    _format_exception,
+    _stop_event_silently,
+    _strip_character_action_output,
+)
 
 
 class FakeEvent:
@@ -602,11 +616,13 @@ class DirectedReplyGuardTest(unittest.TestCase):
 
         asyncio.run(plugin.decorate_llm_request(event, request))
 
-        self.assertIn("不使用括号动作描写", request.system_prompt)
-        self.assertIn("舞台动作", request.system_prompt)
-        self.assertIn("默认 1-2 句", request.system_prompt)
+        self.assertIn("括号动作描写", request.system_prompt)
+        self.assertIn("舞台旁白", request.system_prompt)
+        self.assertIn("1-3", request.system_prompt)
+        self.assertIn("聊天段落", request.system_prompt)
+        self.assertIn("列表、步骤、总结、配置说明", request.system_prompt)
         self.assertIn("不要每句都抢答", request.system_prompt)
-        self.assertIn("可简短接话", request.system_prompt)
+        self.assertIn("简短接话", request.system_prompt)
 
     def test_active_reply_style_emphasizes_lightweight_non_intrusive_reply(self) -> None:
         plugin = build_plugin({"mention_keywords": ["小昭"]})
@@ -648,10 +664,53 @@ class DirectedReplyGuardTest(unittest.TestCase):
 
         asyncio.run(custom.decorate_llm_request(custom_event, custom_request))
 
-        self.assertIn("默认 1-3 句", custom_request.system_prompt)
+        self.assertIn("1-3", custom_request.system_prompt)
+        self.assertIn("聊天段落", custom_request.system_prompt)
 
     def test_empty_exception_name_is_logged(self) -> None:
         self.assertEqual(_format_exception(TimeoutError()), "TimeoutError")
+
+    def test_character_action_output_is_stripped_by_default(self) -> None:
+        self.assertEqual(
+            _strip_character_action_output("（耳朵抖了抖）好，我知道了喵～"),
+            "好，我知道了喵～",
+        )
+        self.assertEqual(
+            _strip_character_action_output("先这样。\n\n（尾巴轻轻晃了晃）\n继续说。"),
+            "先这样。\n\n继续说。",
+        )
+        self.assertEqual(
+            _strip_character_action_output("这个参数（默认 30 秒）可以调大一点。"),
+            "这个参数（默认 30 秒）可以调大一点。",
+        )
+
+    def test_llm_response_action_cleanup_can_be_disabled(self) -> None:
+        class Response:
+            completion_text = "（耳朵抖了抖）好，我知道了喵～"
+
+        disabled = build_plugin({"action_output_enabled": True})
+        enabled = build_plugin({})
+        event = FakeEvent(group_id="group-a", sender_id="user-a")
+
+        disabled_resp = Response()
+        asyncio.run(disabled.clean_llm_response_actions(event, disabled_resp))
+        self.assertEqual(disabled_resp.completion_text, "（耳朵抖了抖）好，我知道了喵～")
+
+        enabled_resp = Response()
+        asyncio.run(enabled.clean_llm_response_actions(event, enabled_resp))
+        self.assertEqual(enabled_resp.completion_text, "好，我知道了喵～")
+
+    def test_natural_chat_style_prefers_short_chat_segments(self) -> None:
+        plugin = build_plugin({})
+
+        reminder = plugin._natural_chat_style_reminder("active_reply")
+
+        self.assertIn("聊天段落", reminder)
+        self.assertIn("列表", reminder)
+        self.assertIn("步骤", reminder)
+        self.assertIn("总结", reminder)
+        self.assertIn("配置说明", reminder)
+        self.assertIn("主动回复", reminder)
 
     def test_silent_stop_does_not_create_empty_result(self) -> None:
         event = FakeEvent()
