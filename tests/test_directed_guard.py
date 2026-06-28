@@ -27,6 +27,7 @@ class FakeEvent:
         self._force_stopped = False
         self.is_at_or_wake_command = False
         self.is_wake = False
+        self.session_id = group_id
         self.stop_event_called = False
         self.result = None
 
@@ -54,6 +55,12 @@ class FakeEvent:
     def get_sender_name(self) -> str:
         return "sender"
 
+    def get_platform_id(self) -> str:
+        return "qq"
+
+    def request_llm(self, **kwargs) -> ProviderRequest:
+        return ProviderRequest(**kwargs)
+
     def stop_event(self) -> None:
         self.stop_event_called = True
         self.result = "stop_result"
@@ -71,6 +78,10 @@ async def _collect_async(async_iterable):
 
 async def _return_skip(event, text):
     return "SKIP"
+
+
+async def _return_conversation(event):
+    return object()
 
 
 class DirectedReplyGuardTest(unittest.TestCase):
@@ -244,6 +255,119 @@ class DirectedReplyGuardTest(unittest.TestCase):
 
         self.assertEqual(items, [])
         self.assertEqual(len(plugin._last_active_judge_attempt_at), 1)
+
+    def test_recent_same_sender_followup_replies_without_keyword(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "active_reply_cooldown_sec": 30,
+                "followup_reply_window_sec": 180,
+            },
+        )
+        plugin._get_or_create_conversation = _return_conversation
+
+        first = FakeEvent(
+            group_id="group-a",
+            sender_id="user-a",
+            text="那小昭你觉得我是男孩子还是女孩子呢？",
+        )
+        asyncio.run(plugin.smart_mention(first))
+
+        followup = FakeEvent(
+            group_id="group-a",
+            sender_id="user-a",
+            text="告诉我你觉得我是男孩子还是女孩子就行了没事的就是好奇问问",
+        )
+        items = list(asyncio.run(_collect_async(plugin.smart_active_reply(followup))))
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(followup.get_extra(EXTRA_DECISION), "REPLY")
+        self.assertTrue(followup.get_extra(EXTRA_REASON).startswith("followup_window:"))
+
+    def test_recent_followup_window_does_not_apply_to_other_senders(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "followup_reply_window_sec": 180,
+            },
+        )
+        plugin._get_or_create_conversation = _return_conversation
+
+        first = FakeEvent(
+            group_id="group-a",
+            sender_id="user-a",
+            text="那小昭你觉得我是男孩子还是女孩子呢？",
+        )
+        asyncio.run(plugin.smart_mention(first))
+
+        other_sender = FakeEvent(
+            group_id="group-a",
+            sender_id="user-b",
+            text="告诉我你觉得我是男孩子还是女孩子就行了没事的就是好奇问问",
+        )
+        items = list(asyncio.run(_collect_async(plugin.smart_active_reply(other_sender))))
+
+        self.assertEqual(items, [])
+        self.assertIsNone(other_sender.get_extra(EXTRA_DECISION))
+
+    def test_recent_followup_window_requires_followup_cue(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "followup_reply_window_sec": 180,
+            },
+        )
+        plugin._get_or_create_conversation = _return_conversation
+
+        first = FakeEvent(
+            group_id="group-a",
+            sender_id="user-a",
+            text="那小昭你觉得我是男孩子还是女孩子呢？",
+        )
+        asyncio.run(plugin.smart_mention(first))
+
+        casual = FakeEvent(group_id="group-a", sender_id="user-a", text="今天群里还挺热闹")
+        items = list(asyncio.run(_collect_async(plugin.smart_active_reply(casual))))
+
+        self.assertEqual(items, [])
+        self.assertIsNone(casual.get_extra(EXTRA_DECISION))
+
+    def test_recent_followup_window_expires(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "followup_reply_window_sec": 180,
+            },
+        )
+        event = FakeEvent(group_id="group-a", sender_id="user-a")
+
+        plugin._record_followup_target(event, now=100)
+        allowed, reason = plugin._recent_followup_reply_reason(
+            event,
+            "告诉我你觉得我是男孩子还是女孩子就行了没事的就是好奇问问",
+            now=281,
+        )
+
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "followup_expired:181.0/180.0s")
+
+    def test_followup_cue_without_recent_target_is_not_enough(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "followup_reply_window_sec": 180,
+            },
+        )
+        event = FakeEvent(group_id="group-a", sender_id="user-a")
+
+        allowed, reason = plugin._recent_followup_reply_reason(
+            event,
+            "告诉我你觉得我是男孩子还是女孩子就行了没事的就是好奇问问",
+            now=100,
+        )
+
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "no_followup_target")
 
     def test_smart_reply_removes_direct_send_tool_from_llm_request(self) -> None:
         plugin = build_plugin({"mention_keywords": ["小昭"]})

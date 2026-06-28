@@ -7,6 +7,7 @@
 - 群聊提到配置的 `mention_keywords` 时，先判断当前消息是不是在叫机器人、问机器人、请求机器人帮忙。
 - 对只是旁观讨论、复述、玩笑、明确说不用回复的消息，尽量不打扰。
 - 支持普通群聊消息的智能主动回复：只有模型判断小昭此刻自然插话有帮助时才回复。
+- 支持短时间续聊：小昭刚回复某人后，同一人不再点名但继续追问时也能自然接上。
 - 自动读取 AstrBot 当前群聊上下文，辅助判断当前对话场景。
 - 对插件触发的回复追加系统提醒，让小昭自然回应，不解释触发机制，也不特意强调对方是不是主人。
 - 原生 `@机器人`、回复机器人消息等场景会先经过防刷屏冷却，再交给 AstrBot 默认流程处理。
@@ -71,6 +72,7 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 | `judge_timeout_sec` | int | `8` | 智能判定模型调用超时时间，单位秒。 |
 | `active_reply_enabled` | bool | `true` | 是否启用未被点名时的智能主动回复。 |
 | `active_reply_cooldown_sec` | int | `30` | 同一会话内主动回复冷却时间，避免连续抢话。 |
+| `followup_reply_window_sec` | int | `180` | 小昭刚回复某人后，同一群同一人未点名但继续追问时的续聊窗口；设为 `0` 可关闭。 |
 | `active_judge_attempt_cooldown_sec` | int | `45` | 无关键词主动回复判定尝试冷却时间；无论最后是否回复，都避免每条普通消息都请求模型判定。 |
 | `judge_failure_backoff_sec` | int | `120` | 智能判定模型超时、429 或其他失败后的熔断时间；熔断期间跳过智能判定，但不会拦截明确的规则点名回复。 |
 | `directed_reply_guard_enabled` | bool | `true` | 是否启用原生 `@机器人`、回复机器人消息、文字点名机器人的防刷屏冷却。 |
@@ -80,6 +82,7 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 | `owner_ids` | list | `[]` | 主人用户 ID 列表。仓库默认留空，请在本机配置里填写真实平台用户 ID。 |
 | `mention_keywords` | list | `["小昭", "小昭猫娘"]` | 群聊提及时用于进入智能提及判断的关键词，可改成任意机器人昵称、别名或唤醒称呼。 |
 | `aliases` | list | `["小昭", "小昭猫娘"]` | 旧版兼容项；新配置请优先使用 `mention_keywords`。 |
+| `followup_reply_cue_patterns` | list | 见配置文件 | 续聊窗口内判断同一人未点名消息是否像追问、纠正或要求继续回答的规则。 |
 
 配置修改后重启 AstrBot，或在 AstrBot 插件管理中重新加载插件。
 
@@ -121,6 +124,12 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 - 当前消息不像提问、求助、配置讨论或需要补充意见的场景。
 
 模型只在认为机器人自然插话有帮助时返回 `REPLY`。例如有人提出开放问题、求助、讨论卡住、需要总结或配置帮助。普通闲聊、短表情、刷屏、两人正在私下对话时应返回 `SKIP`。
+
+### 续聊窗口
+
+当小昭刚刚回复过某个发送者后，插件会记录这个“当前对话目标”。在 `followup_reply_window_sec` 秒内，如果同一群、同一机器人、同一发送者继续发出像追问、纠正、要求直接回答的消息，即使没有再次提到 `mention_keywords`，插件也会接着回复。
+
+该机制只对同一发送者生效，别人插话不会继承这个窗口；普通闲聊也不会仅因为窗口存在而触发。如果觉得续聊太积极，可以把 `followup_reply_window_sec` 调小，或设为 `0` 关闭。
 
 ### 点名机器人时
 
@@ -173,6 +182,7 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 ### 小昭主动回复太频繁
 
 - 增大 `active_reply_cooldown_sec`。
+- 调小或关闭 `followup_reply_window_sec`，减少同一人未点名续聊。
 - 增大 `active_judge_attempt_cooldown_sec`，减少普通消息触发判定模型的频率。
 - 关闭 `active_reply_enabled`，只保留提及判断。
 - 确认 AstrBot 内置主动回复已关闭，避免重复机制。

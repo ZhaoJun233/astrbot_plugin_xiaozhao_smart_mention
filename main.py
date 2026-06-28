@@ -38,6 +38,12 @@ DEFAULT_ACTIVE_REPLY_CUE_PATTERNS = [
     r"(?:配置|设置|插件|模型|机器人|provider|token|冷却|限流|429)",
     r"(?:看法|意见|建议|分析一下|解释一下|总结一下)",
 ]
+DEFAULT_FOLLOWUP_REPLY_CUE_PATTERNS = [
+    r"[?？]",
+    r"(?:告诉我|直接说|直说|回答|继续|接着|就行|没事|好奇|问问)",
+    r"(?:你觉得|你认为|你猜|猜一下|选一个|到底|所以|那你|那么)",
+    r"(?:不是|不对|我是说|我问的是|别绕|别跑题|刚才|上一句)",
+]
 
 
 def _dedupe(items: Iterable[str]) -> list[str]:
@@ -145,6 +151,10 @@ class Main(Star):
         self.active_reply_cooldown_sec = float(
             self.config.get("active_reply_cooldown_sec", 30),
         )
+        self.followup_reply_window_sec = _as_float(
+            self.config.get("followup_reply_window_sec"),
+            180,
+        )
         self.active_judge_attempt_cooldown_sec = _as_float(
             self.config.get("active_judge_attempt_cooldown_sec"),
             45,
@@ -187,11 +197,18 @@ class Main(Star):
                 DEFAULT_ACTIVE_REPLY_CUE_PATTERNS,
             ),
         )
+        self.followup_reply_cue_patterns = _compile_patterns(
+            _as_list(
+                self.config.get("followup_reply_cue_patterns"),
+                DEFAULT_FOLLOWUP_REPLY_CUE_PATTERNS,
+            ),
+        )
         self._last_active_reply_at: dict[str, float] = {}
         self._last_active_judge_attempt_at: dict[str, float] = {}
         self._judge_backoff_until: dict[str, float] = {}
         self._last_directed_group_at: dict[str, float] = {}
         self._last_directed_sender_at: dict[str, float] = {}
+        self._last_followup_target_at: dict[str, float] = {}
 
     async def initialize(self) -> None:
         logger.info(
@@ -216,6 +233,7 @@ class Main(Star):
 
         allowed, reason = self._consume_directed_reply_slot(event)
         if allowed:
+            self._record_followup_target(event)
             return
 
         text = event.get_message_str().strip()
@@ -265,6 +283,7 @@ class Main(Star):
             event.set_extra(EXTRA_MODE, "mention")
             event.is_wake = True
             event.is_at_or_wake_command = True
+            self._record_followup_target(event)
             logger.info(
                 "%s reply: group=%s sender=%s reason=%s text=%s",
                 PLUGIN_TAG,
@@ -311,6 +330,21 @@ class Main(Star):
             return
         if _contains_keyword(text, self.mention_keywords):
             return
+        followup_allowed, followup_reason = self._recent_followup_reply_reason(
+            event,
+            text,
+        )
+        if followup_allowed:
+            request = await self._build_active_reply_request(
+                event,
+                text,
+                followup_reason,
+            )
+            if request is None:
+                return
+            yield request
+            _stop_event_silently(event)
+            return
         if not self._has_active_reply_cue(text):
             logger.debug("%s active skip: no_active_reply_cue", PLUGIN_TAG)
             return
@@ -347,30 +381,49 @@ class Main(Star):
             )
             return
 
-        conversation = await self._get_or_create_conversation(event)
-        if conversation is None:
+        request = await self._build_active_reply_request(
+            event,
+            text,
+            "active_llm_judge",
+        )
+        if request is None:
             return
 
+        yield request
+        _stop_event_silently(event)
+
+    async def _build_active_reply_request(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        reason: str,
+    ) -> ProviderRequest | None:
+        conversation = await self._get_or_create_conversation(event)
+        if conversation is None:
+            return None
+
+        cooldown_key = event.unified_msg_origin
         event.set_extra(EXTRA_DECISION, "REPLY")
-        event.set_extra(EXTRA_REASON, "active_llm_judge")
+        event.set_extra(EXTRA_REASON, reason)
         event.set_extra(EXTRA_MODE, "active_reply")
         self._last_active_reply_at[cooldown_key] = monotonic()
+        self._record_followup_target(event)
 
         logger.info(
-            "%s active reply: group=%s sender=%s text=%s",
+            "%s active reply: group=%s sender=%s reason=%s text=%s",
             PLUGIN_TAG,
             event.get_group_id(),
             event.get_sender_id(),
+            reason,
             _clip(text),
         )
 
-        yield event.request_llm(
+        return event.request_llm(
             prompt=text,
             session_id=event.session_id,
             image_urls=await self._collect_image_urls(event),
             conversation=conversation,
         )
-        _stop_event_silently(event)
 
     @filter.on_llm_request(priority=80)
     async def decorate_llm_request(
@@ -540,6 +593,52 @@ class Main(Star):
 
     def _has_active_reply_cue(self, text: str) -> bool:
         return any(pattern.search(text) for pattern in self.active_reply_cue_patterns)
+
+    def _has_followup_reply_cue(self, text: str) -> bool:
+        return any(pattern.search(text) for pattern in self.followup_reply_cue_patterns)
+
+    def _record_followup_target(
+        self,
+        event: AstrMessageEvent,
+        *,
+        now: float | None = None,
+    ) -> None:
+        if self.followup_reply_window_sec <= 0:
+            return
+        now = monotonic() if now is None else now
+        self._last_followup_target_at[self._followup_reply_key(event)] = now
+
+    def _recent_followup_reply_reason(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        *,
+        now: float | None = None,
+    ) -> tuple[bool, str]:
+        if self.followup_reply_window_sec <= 0:
+            return False, "followup_disabled"
+        if not self._has_followup_reply_cue(text):
+            return False, "no_followup_reply_cue"
+
+        now = monotonic() if now is None else now
+        key = self._followup_reply_key(event)
+        last_target_at = self._last_followup_target_at.get(key)
+        if last_target_at is None:
+            return False, "no_followup_target"
+
+        elapsed = now - last_target_at
+        if elapsed <= self.followup_reply_window_sec:
+            return (
+                True,
+                f"followup_window:{elapsed:.1f}/{self.followup_reply_window_sec:.1f}s",
+            )
+        return False, f"followup_expired:{elapsed:.1f}/{self.followup_reply_window_sec:.1f}s"
+
+    def _followup_reply_key(self, event: AstrMessageEvent) -> str:
+        return (
+            f"{event.unified_msg_origin}:bot:{event.get_self_id()}:"
+            f"sender:{event.get_sender_id()}"
+        )
 
     async def _decide(self, event: AstrMessageEvent, text: str) -> tuple[str, str]:
         for pattern in self.skip_patterns:
