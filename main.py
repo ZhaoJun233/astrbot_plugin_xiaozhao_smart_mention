@@ -265,6 +265,7 @@ def _is_structured_or_technical_reply(text: str) -> bool:
 
 
 def _natural_local_segments(text: str, max_segments: int) -> list[str]:
+    max_segments = max(1, max_segments)
     formatted = _format_natural_chat_paragraphs(text, max_segments)
     segments = [
         segment.strip()
@@ -273,7 +274,9 @@ def _natural_local_segments(text: str, max_segments: int) -> list[str]:
     ]
     if not segments and text.strip():
         segments = [text.strip()]
-    return segments[:max(1, max_segments)]
+    if len(segments) > max_segments:
+        segments = segments[: max_segments - 1] + ["".join(segments[max_segments - 1 :])]
+    return segments
 
 
 def _extract_segment_json(text: str) -> dict | None:
@@ -319,11 +322,17 @@ def _are_usable_segments(original: str, segments: list[str], max_segments: int) 
     if len(segments) < 2 or len(segments) > max(1, max_segments):
         return False
     joined = "".join(segments)
+    if _normalise_segment_text(joined) != _normalise_segment_text(original):
+        return False
     if len(joined) > max(len(original) * 2, len(original) + 80):
         return False
     if any(segment.lower().startswith(("整理后的", "以下是", "好的", "可以，")) for segment in segments):
         return False
     return True
+
+
+def _normalise_segment_text(text: str) -> str:
+    return re.sub(r"\s+", "", text or "")
 
 
 def _normalise_chat_completions_url(api_base: str) -> str:
@@ -968,17 +977,29 @@ class Main(Star):
         if len(segments) < 2:
             return
 
-        for index, segment in enumerate(segments):
-            if index > 0 and self.smart_segment_interval_sec > 0:
-                await asyncio.sleep(
-                    random.uniform(
-                        self.smart_segment_interval_sec * 0.7,
-                        self.smart_segment_interval_sec * 1.3,
-                    ),
-                )
-            await event.send(result.derive([Plain(segment)]))
-
         event.clear_result()
+        sent_count = 0
+        try:
+            for index, segment in enumerate(segments):
+                if index > 0 and self.smart_segment_interval_sec > 0:
+                    await asyncio.sleep(
+                        random.uniform(
+                            self.smart_segment_interval_sec * 0.7,
+                            self.smart_segment_interval_sec * 1.3,
+                        ),
+                    )
+                await event.send(result.derive([Plain(segment)]))
+                sent_count += 1
+        except Exception as exc:
+            logger.warning(
+                "%s smart segmented send failed after %s/%s segments: %s",
+                PLUGIN_TAG,
+                sent_count,
+                len(segments),
+                _format_exception(exc),
+            )
+            return
+
         logger.info(
             "%s smart segmented send: group=%s sender=%s segments=%s",
             PLUGIN_TAG,

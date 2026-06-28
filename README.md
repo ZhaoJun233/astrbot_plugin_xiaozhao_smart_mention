@@ -100,10 +100,10 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 
 配置修改后重启 AstrBot，或在 AstrBot 插件管理中重新加载插件。
 
-例如想让“赵小昭”“小赵”“bot”都能进入智能提及判断，可以配置：
+例如想让“小昭”“小昭猫娘”“bot”都能进入智能提及判断，可以配置：
 
 ```json
-"mention_keywords": ["赵小昭", "小赵", "bot"]
+"mention_keywords": ["小昭", "小昭猫娘", "bot"]
 ```
 
 如果希望某些主人账号不受连续 `@机器人` 防刷屏冷却影响，可以配置：

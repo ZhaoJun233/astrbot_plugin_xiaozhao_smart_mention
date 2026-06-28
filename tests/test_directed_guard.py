@@ -203,6 +203,7 @@ from main import (
     _format_natural_chat_paragraphs,
     _is_structured_or_technical_reply,
     _natural_local_segments,
+    _normalise_model_segments,
     _stop_event_silently,
     _strip_character_action_output,
 )
@@ -234,6 +235,7 @@ class FakeEvent:
         self.stop_event_called = False
         self.result = None
         self.sent_messages = []
+        self.fail_send_at: int | None = None
 
     def get_group_id(self) -> str:
         return self._group_id
@@ -275,6 +277,8 @@ class FakeEvent:
         self.result = None
 
     async def send(self, message) -> None:
+        if self.fail_send_at is not None and len(self.sent_messages) + 1 == self.fail_send_at:
+            raise RuntimeError("send failed")
         self.sent_messages.append(message)
 
     def stop_event(self) -> None:
@@ -883,7 +887,25 @@ class DirectedReplyGuardTest(unittest.TestCase):
             "主人别逗小昭了喵～再这样下去小昭都要不知道怎么接话了。"
         )
 
-        self.assertLessEqual(len(_natural_local_segments(text, 2)), 2)
+        segments = _natural_local_segments(text, 2)
+
+        self.assertLessEqual(len(segments), 2)
+        self.assertEqual("".join(segments), text)
+
+    def test_local_segment_fallback_merges_extra_existing_paragraphs(self) -> None:
+        text = "收到测试信号喵～！\n\n小昭状态正常，可爱值也在线。\n\n主人还想测什么，小昭继续陪着。"
+
+        segments = _natural_local_segments(text, 2)
+
+        self.assertEqual(len(segments), 2)
+        self.assertEqual("".join(segments), text.replace("\n\n", ""))
+        self.assertEqual(segments[-1], "小昭状态正常，可爱值也在线。主人还想测什么，小昭继续陪着。")
+
+    def test_model_segments_must_preserve_original_text(self) -> None:
+        original = "收到测试信号喵～！小昭状态正常，可爱值也在线，刚刚那次调用没有掉线。主人还想测什么，小昭继续陪着。"
+        raw = '{"segments":["收到测试信号喵～！","主人还想测什么，小昭继续陪着。"]}'
+
+        self.assertIsNone(_normalise_model_segments(original, raw, 5))
 
     def test_structured_or_technical_reply_is_not_auto_split(self) -> None:
         text = (
@@ -972,7 +994,7 @@ class DirectedReplyGuardTest(unittest.TestCase):
 
     def test_decorating_result_sends_model_segments_as_separate_messages(self) -> None:
         provider = FakeProvider(
-            '{"segments":["收到测试信号喵～！","小昭状态正常，可爱值也在线！","主人还想测什么，小昭继续陪着。"]}',
+            '{"segments":["收到测试信号喵～！","小昭状态正常，可爱值也在线，刚刚那次调用没有掉线。","主人还想测什么，小昭继续陪着。"]}',
         )
         plugin = build_plugin({"smart_segment_interval_sec": 0})
         plugin.context = FakeContext(provider)
@@ -991,12 +1013,34 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertEqual(len(event.sent_messages), 3)
         self.assertEqual([msg.chain[0].text for msg in event.sent_messages], [
             "收到测试信号喵～！",
-            "小昭状态正常，可爱值也在线！",
+            "小昭状态正常，可爱值也在线，刚刚那次调用没有掉线。",
             "主人还想测什么，小昭继续陪着。",
         ])
         self.assertIn("JSON", provider.calls[0]["system_prompt"])
         self.assertIn("数量由自然语气决定，不固定", provider.calls[0]["system_prompt"])
         self.assertIn("不要固定段数", provider.calls[0]["prompt"])
+
+    def test_decorating_result_clears_original_when_segment_send_partially_fails(self) -> None:
+        provider = FakeProvider(
+            '{"segments":["收到测试信号喵～！","小昭状态正常，可爱值也在线，刚刚那次调用没有掉线。","主人还想测什么，小昭继续陪着。"]}',
+        )
+        plugin = build_plugin({"smart_segment_interval_sec": 0})
+        plugin.context = FakeContext(provider)
+        event = FakeEvent(group_id="private-a", sender_id="user-a")
+        event.fail_send_at = 2
+        event.result = FakeResult(
+            [
+                Plain(
+                    "收到测试信号喵～！小昭状态正常，可爱值也在线，刚刚那次调用没有掉线。主人还想测什么，小昭继续陪着。",
+                ),
+            ],
+        )
+
+        asyncio.run(plugin.send_natural_segments(event))
+
+        self.assertIsNone(event.result)
+        self.assertEqual(len(event.sent_messages), 1)
+        self.assertEqual(event.sent_messages[0].chain[0].text, "收到测试信号喵～！")
 
     def test_decorating_result_keeps_structured_reply_on_default_pipeline(self) -> None:
         provider = FakeProvider('{"segments":["不应该调用"]}')
