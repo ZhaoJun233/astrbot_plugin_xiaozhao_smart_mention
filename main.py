@@ -84,6 +84,13 @@ def _as_float(value, fallback: float) -> float:
         return fallback
 
 
+def _as_int(value, fallback: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
 def _resolve_mention_keywords(config) -> list[str]:
     mention_keywords = _as_list(
         config.get("mention_keywords"),
@@ -150,6 +157,13 @@ class Main(Star):
         self.active_reply_enabled = bool(self.config.get("active_reply_enabled", True))
         self.active_reply_cooldown_sec = float(
             self.config.get("active_reply_cooldown_sec", 30),
+        )
+        self.natural_chat_style_enabled = bool(
+            self.config.get("natural_chat_style_enabled", True),
+        )
+        self.natural_chat_max_sentences = max(
+            1,
+            _as_int(self.config.get("natural_chat_max_sentences"), 2),
         )
         self.followup_reply_window_sec = _as_float(
             self.config.get("followup_reply_window_sec"),
@@ -335,6 +349,10 @@ class Main(Star):
             text,
         )
         if followup_allowed:
+            cooling_down, cooldown_reason = self._is_active_reply_cooldown_active(event)
+            if cooling_down:
+                logger.debug("%s active skip: %s", PLUGIN_TAG, cooldown_reason)
+                return
             request = await self._build_active_reply_request(
                 event,
                 text,
@@ -349,15 +367,9 @@ class Main(Star):
             logger.debug("%s active skip: no_active_reply_cue", PLUGIN_TAG)
             return
 
-        cooldown_key = event.unified_msg_origin
-        elapsed = monotonic() - self._last_active_reply_at.get(cooldown_key, 0)
-        if elapsed < self.active_reply_cooldown_sec:
-            logger.debug(
-                "%s active skip: cooldown %.1fs/%.1fs",
-                PLUGIN_TAG,
-                elapsed,
-                self.active_reply_cooldown_sec,
-            )
+        cooling_down, cooldown_reason = self._is_active_reply_cooldown_active(event)
+        if cooling_down:
+            logger.debug("%s active skip: %s", PLUGIN_TAG, cooldown_reason)
             return
 
         backing_off, reason = self._is_judge_backoff_active(event)
@@ -452,9 +464,23 @@ class Main(Star):
             f"当前发言人昵称/ID: {sender_name}/{sender_id}。"
             "请自然回应当前场景；"
             "不要解释触发机制，不要特意强调对方是不是主人。"
+            f"{self._natural_chat_style_reminder(mode)}"
             "</system_reminder>"
         )
         req.system_prompt = (req.system_prompt or "") + "\n" + note
+
+    def _natural_chat_style_reminder(self, mode: str) -> str:
+        if not self.natural_chat_style_enabled:
+            return ""
+
+        reminder = (
+            "按实时群聊的自然对话来回：不使用括号动作描写，不写舞台动作；"
+            f"默认 1-{self.natural_chat_max_sentences} 句，能一句说明白就别展开；"
+            "不要每句都抢答，只在当前话题需要时可简短接话。"
+        )
+        if mode == "active_reply":
+            reminder += "本轮是主动回复，更要轻量接话、不抢话。"
+        return reminder
 
     def _remove_direct_send_tool(self, req: ProviderRequest) -> None:
         if req.func_tool is None:
@@ -590,6 +616,24 @@ class Main(Star):
 
     def _active_judge_attempt_key(self, event: AstrMessageEvent) -> str:
         return self._judge_backoff_key(event)
+
+    def _is_active_reply_cooldown_active(
+        self,
+        event: AstrMessageEvent,
+        *,
+        now: float | None = None,
+    ) -> tuple[bool, str]:
+        if self.active_reply_cooldown_sec <= 0:
+            return False, "allowed"
+        now = monotonic() if now is None else now
+        key = event.unified_msg_origin
+        elapsed = now - self._last_active_reply_at.get(key, 0)
+        if elapsed < self.active_reply_cooldown_sec:
+            return (
+                True,
+                f"cooldown:{elapsed:.1f}/{self.active_reply_cooldown_sec:.1f}s",
+            )
+        return False, "allowed"
 
     def _has_active_reply_cue(self, text: str) -> bool:
         return any(pattern.search(text) for pattern in self.active_reply_cue_patterns)

@@ -10,6 +10,7 @@
 - 支持短时间续聊：小昭刚回复某人后，同一人不再点名但继续追问时也能自然接上。
 - 自动读取 AstrBot 当前群聊上下文，辅助判断当前对话场景。
 - 对插件触发的回复追加系统提醒，让小昭自然回应，不解释触发机制，也不特意强调对方是不是主人。
+- 默认追加自然群聊风格约束：不使用括号动作描写或舞台动作，通常 1-2 句，必要时简短接话，不每句都抢答。
 - 原生 `@机器人`、回复机器人消息等场景会先经过防刷屏冷却，再交给 AstrBot 默认流程处理。
 - 主人 ID 可在插件配置里自定义；仓库默认不写入任何真实用户 ID。
 
@@ -72,6 +73,8 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 | `judge_timeout_sec` | int | `8` | 智能判定模型调用超时时间，单位秒。 |
 | `active_reply_enabled` | bool | `true` | 是否启用未被点名时的智能主动回复。 |
 | `active_reply_cooldown_sec` | int | `30` | 同一会话内主动回复冷却时间，避免连续抢话。 |
+| `natural_chat_style_enabled` | bool | `true` | 是否在插件触发的回复中追加自然群聊风格约束，避免括号动作描写、舞台动作和过度抢答。 |
+| `natural_chat_max_sentences` | int | `2` | 自然群聊风格约束下默认回复的最大句数；默认提示为 `1-2` 句。 |
 | `followup_reply_window_sec` | int | `180` | 小昭刚回复某人后，同一群同一人未点名但继续追问时的续聊窗口；设为 `0` 可关闭。 |
 | `active_judge_attempt_cooldown_sec` | int | `45` | 无关键词主动回复判定尝试冷却时间；无论最后是否回复，都避免每条普通消息都请求模型判定。 |
 | `judge_failure_backoff_sec` | int | `120` | 智能判定模型超时、429 或其他失败后的熔断时间；熔断期间跳过智能判定，但不会拦截明确的规则点名回复。 |
@@ -109,6 +112,8 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 3. 规则不确定时，如果 `use_llm_judge=true`，调用当前模型只输出 `REPLY` 或 `SKIP`。
 4. 判定为 `REPLY` 时，把本轮消息标记为唤醒消息，交给 AstrBot 正常 LLM 流程生成回复。
 
+如果 `natural_chat_style_enabled=true`，插件会在本轮 LLM 请求里追加一段稳定的系统提醒：按实时群聊自然对话回复，不使用括号动作描写或舞台动作，默认控制在 `natural_chat_max_sentences` 指定的句数内，并且不要每句都抢答。
+
 ### 主动回复时
 
 插件监听普通群聊消息，但会跳过以下情况：
@@ -125,11 +130,13 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 
 模型只在认为机器人自然插话有帮助时返回 `REPLY`。例如有人提出开放问题、求助、讨论卡住、需要总结或配置帮助。普通闲聊、短表情、刷屏、两人正在私下对话时应返回 `SKIP`。
 
+主动回复生成内容时还会额外强调“轻量接话、不抢话”，让它更像群聊里顺手补一句，而不是把每条消息都当成正式问答。
+
 ### 续聊窗口
 
 当小昭刚刚回复过某个发送者后，插件会记录这个“当前对话目标”。在 `followup_reply_window_sec` 秒内，如果同一群、同一机器人、同一发送者继续发出像追问、纠正、要求直接回答的消息，即使没有再次提到 `mention_keywords`，插件也会接着回复。
 
-该机制只对同一发送者生效，别人插话不会继承这个窗口；普通闲聊也不会仅因为窗口存在而触发。如果觉得续聊太积极，可以把 `followup_reply_window_sec` 调小，或设为 `0` 关闭。
+该机制只对同一发送者生效，别人插话不会继承这个窗口；普通闲聊也不会仅因为窗口存在而触发。续聊在主动回复或续聊回复之后也会尊重 `active_reply_cooldown_sec`，避免同一段无关键词对话被一句一句接管；明确点名仍走点名逻辑。如果觉得续聊太积极，可以把 `followup_reply_window_sec` 调小，或设为 `0` 关闭。
 
 ### 点名机器人时
 

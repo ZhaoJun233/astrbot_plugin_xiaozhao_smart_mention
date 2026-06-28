@@ -1,11 +1,179 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+import types
 import unittest
 from time import monotonic
 
-from astrbot.core.agent.tool import FunctionTool, ToolSet
-from astrbot.core.provider.entities import ProviderRequest
+
+def _install_astrbot_test_stubs() -> None:
+    astrbot = types.ModuleType("astrbot")
+
+    class _Logger:
+        def debug(self, *args, **kwargs) -> None:
+            pass
+
+        def info(self, *args, **kwargs) -> None:
+            pass
+
+        def warning(self, *args, **kwargs) -> None:
+            pass
+
+    astrbot.logger = _Logger()
+    sys.modules["astrbot"] = astrbot
+
+    api_event = types.ModuleType("astrbot.api.event")
+
+    class AstrMessageEvent:
+        pass
+
+    class _Filter:
+        class EventMessageType:
+            GROUP_MESSAGE = "GROUP_MESSAGE"
+
+        @staticmethod
+        def event_message_type(*args, **kwargs):
+            def decorator(func):
+                return func
+
+            return decorator
+
+        @staticmethod
+        def custom_filter(*args, **kwargs):
+            def decorator(func):
+                return func
+
+            return decorator
+
+        @staticmethod
+        def on_llm_request(*args, **kwargs):
+            def decorator(func):
+                return func
+
+            return decorator
+
+    api_event.AstrMessageEvent = AstrMessageEvent
+    api_event.filter = _Filter
+    sys.modules["astrbot.api.event"] = api_event
+
+    api_message_components = types.ModuleType("astrbot.api.message_components")
+
+    class At:
+        def __init__(self, qq=None) -> None:
+            self.qq = qq
+
+    class AtAll:
+        pass
+
+    class Image:
+        async def convert_to_file_path(self) -> str:
+            return ""
+
+    class Reply:
+        def __init__(self, sender_id=None) -> None:
+            self.sender_id = sender_id
+
+    api_message_components.At = At
+    api_message_components.AtAll = AtAll
+    api_message_components.Image = Image
+    api_message_components.Reply = Reply
+    sys.modules["astrbot.api.message_components"] = api_message_components
+
+    provider_module = types.ModuleType("astrbot.api.provider")
+    provider_entities = types.ModuleType("astrbot.core.provider.entities")
+
+    class ProviderRequest:
+        def __init__(
+            self,
+            *,
+            prompt=None,
+            session_id=None,
+            image_urls=None,
+            conversation=None,
+            system_prompt=None,
+            func_tool=None,
+        ) -> None:
+            self.prompt = prompt
+            self.session_id = session_id
+            self.image_urls = image_urls
+            self.conversation = conversation
+            self.system_prompt = system_prompt
+            self.func_tool = func_tool
+
+    provider_module.ProviderRequest = ProviderRequest
+    provider_entities.ProviderRequest = ProviderRequest
+    sys.modules["astrbot.api.provider"] = provider_module
+    sys.modules["astrbot.core.provider.entities"] = provider_entities
+
+    api_star = types.ModuleType("astrbot.api.star")
+
+    class Context:
+        pass
+
+    class Star:
+        def __init__(self, context) -> None:
+            self.context = context
+
+    api_star.Context = Context
+    api_star.Star = Star
+    sys.modules["astrbot.api.star"] = api_star
+
+    core_config = types.ModuleType("astrbot.core.config")
+
+    class AstrBotConfig(dict):
+        pass
+
+    core_config.AstrBotConfig = AstrBotConfig
+    sys.modules["astrbot.core.config"] = core_config
+
+    message_type = types.ModuleType("astrbot.core.platform.message_type")
+
+    class MessageType:
+        GROUP_MESSAGE = "GROUP_MESSAGE"
+
+    message_type.MessageType = MessageType
+    sys.modules["astrbot.core.platform.message_type"] = message_type
+
+    custom_filter = types.ModuleType("astrbot.core.star.filter.custom_filter")
+
+    class CustomFilter:
+        pass
+
+    custom_filter.CustomFilter = CustomFilter
+    sys.modules["astrbot.core.star.filter.custom_filter"] = custom_filter
+
+    agent_tool = types.ModuleType("astrbot.core.agent.tool")
+
+    class FunctionTool:
+        def __init__(self, *, name, description, parameters) -> None:
+            self.name = name
+            self.description = description
+            self.parameters = parameters
+
+    class ToolSet:
+        def __init__(self, tools) -> None:
+            self._tools = list(tools)
+
+        def remove_tool(self, name: str) -> None:
+            self._tools = [tool for tool in self._tools if tool.name != name]
+
+        def names(self) -> list[str]:
+            return [tool.name for tool in self._tools]
+
+    agent_tool.FunctionTool = FunctionTool
+    agent_tool.ToolSet = ToolSet
+    sys.modules["astrbot.core.agent.tool"] = agent_tool
+
+
+try:
+    from astrbot.core.agent.tool import FunctionTool, ToolSet
+    from astrbot.core.provider.entities import ProviderRequest
+except ModuleNotFoundError:
+    _install_astrbot_test_stubs()
+    from astrbot.core.agent.tool import FunctionTool, ToolSet
+    from astrbot.core.provider.entities import ProviderRequest
+
 from main import EXTRA_DECISION, EXTRA_REASON, Main, _format_exception, _stop_event_silently
 
 
@@ -284,6 +452,37 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertEqual(followup.get_extra(EXTRA_DECISION), "REPLY")
         self.assertTrue(followup.get_extra(EXTRA_REASON).startswith("followup_window:"))
 
+    def test_followup_reply_respects_active_reply_cooldown_after_active_reply(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["灏忔槶"],
+                "active_reply_cooldown_sec": 30,
+                "followup_reply_window_sec": 180,
+            },
+        )
+        plugin._get_or_create_conversation = _return_conversation
+        plugin._recent_followup_reply_reason = lambda event, text: (
+            True,
+            "followup_window:1.0/180.0s",
+        )
+        active = FakeEvent(
+            group_id="group-a",
+            sender_id="user-a",
+            text="杩欎釜閰嶇疆鎬庝箞鏀规墠濂斤紵",
+        )
+        plugin._record_followup_target(active, now=100)
+        plugin._last_active_reply_at[active.unified_msg_origin] = monotonic()
+
+        followup = FakeEvent(
+            group_id="group-a",
+            sender_id="user-a",
+            text="鍛婅瘔鎴戠洿鎺ョ瓟妗堝氨琛?",
+        )
+        items = list(asyncio.run(_collect_async(plugin.smart_active_reply(followup))))
+
+        self.assertEqual(items, [])
+        self.assertIsNone(followup.get_extra(EXTRA_DECISION))
+
     def test_recent_followup_window_does_not_apply_to_other_senders(self) -> None:
         plugin = build_plugin(
             {
@@ -394,6 +593,62 @@ class DirectedReplyGuardTest(unittest.TestCase):
 
         self.assertIsNotNone(request.func_tool)
         self.assertEqual(request.func_tool.names(), ["keep_this_tool"])
+
+    def test_smart_reply_adds_natural_group_chat_style_to_llm_request(self) -> None:
+        plugin = build_plugin({"mention_keywords": ["小昭"]})
+        event = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭，测试")
+        event.set_extra(EXTRA_DECISION, "REPLY")
+        request = ProviderRequest(system_prompt="base prompt")
+
+        asyncio.run(plugin.decorate_llm_request(event, request))
+
+        self.assertIn("不使用括号动作描写", request.system_prompt)
+        self.assertIn("舞台动作", request.system_prompt)
+        self.assertIn("默认 1-2 句", request.system_prompt)
+        self.assertIn("不要每句都抢答", request.system_prompt)
+        self.assertIn("可简短接话", request.system_prompt)
+
+    def test_active_reply_style_emphasizes_lightweight_non_intrusive_reply(self) -> None:
+        plugin = build_plugin({"mention_keywords": ["小昭"]})
+        event = FakeEvent(group_id="group-a", sender_id="user-a", text="这个配置怎么改？")
+        event.set_extra(EXTRA_DECISION, "REPLY")
+        event.set_extra("xiaozhao_smart_mention_mode", "active_reply")
+        request = ProviderRequest()
+
+        asyncio.run(plugin.decorate_llm_request(event, request))
+
+        self.assertIn("群聊智能主动回复", request.system_prompt)
+        self.assertIn("轻量接话", request.system_prompt)
+        self.assertIn("不抢话", request.system_prompt)
+
+    def test_natural_group_chat_style_can_be_disabled_or_limited_by_config(self) -> None:
+        disabled = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "natural_chat_style_enabled": False,
+            },
+        )
+        disabled_event = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭，测试")
+        disabled_event.set_extra(EXTRA_DECISION, "REPLY")
+        disabled_request = ProviderRequest()
+
+        asyncio.run(disabled.decorate_llm_request(disabled_event, disabled_request))
+
+        self.assertNotIn("不使用括号动作描写", disabled_request.system_prompt)
+
+        custom = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "natural_chat_max_sentences": 3,
+            },
+        )
+        custom_event = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭，测试")
+        custom_event.set_extra(EXTRA_DECISION, "REPLY")
+        custom_request = ProviderRequest()
+
+        asyncio.run(custom.decorate_llm_request(custom_event, custom_request))
+
+        self.assertIn("默认 1-3 句", custom_request.system_prompt)
 
     def test_empty_exception_name_is_logged(self) -> None:
         self.assertEqual(_format_exception(TimeoutError()), "TimeoutError")

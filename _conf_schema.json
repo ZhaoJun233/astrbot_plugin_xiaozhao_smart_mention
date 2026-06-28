@@ -23,6 +23,18 @@
     "type": "int",
     "default": 30
   },
+  "natural_chat_style_enabled": {
+    "description": "自然群聊风格约束",
+    "hint": "插件触发回复时追加自然群聊风格提醒：不使用括号动作描写或舞台动作，默认简短接话，避免每句都抢答。",
+    "type": "bool",
+    "default": true
+  },
+  "natural_chat_max_sentences": {
+    "description": "自然回复最大句数",
+    "hint": "自然群聊风格约束下默认回复的最大句数；建议保持 1 到 3，避免日常群聊里回复过长。",
+    "type": "int",
+    "default": 2
+  },
   "followup_reply_window_sec": {
     "description": "续聊窗口（秒）",
     "hint": "机器人刚回复某人后，同一群同一人未再点名但继续追问时，允许在该时间内接着回复；设为 0 可关闭。",
