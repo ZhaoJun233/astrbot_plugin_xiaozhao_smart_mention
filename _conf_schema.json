@@ -11,30 +11,6 @@
     "type": "int",
     "default": 8
   },
-  "custom_ai_enabled": {
-    "description": "自定义内部智能模型",
-    "hint": "开启后，插件自己的提及判定、主动回复判定、自然改写和智能分段会优先调用自定义 OpenAI 兼容接口；失败时退回 AstrBot 当前 provider。",
-    "type": "bool",
-    "default": false
-  },
-  "custom_ai_api_base": {
-    "description": "自定义模型 API URL",
-    "hint": "OpenAI 兼容接口地址，可填 https://example.com/v1，也可填完整的 /chat/completions 地址。留空时使用 AstrBot 当前 provider。",
-    "type": "string",
-    "default": ""
-  },
-  "custom_ai_api_key": {
-    "description": "自定义模型 API Key",
-    "hint": "自定义接口的密钥。仅保存在本机插件配置中；如果本地代理不需要鉴权，可以留空。",
-    "type": "string",
-    "default": ""
-  },
-  "custom_ai_model": {
-    "description": "自定义模型名称",
-    "hint": "传给 OpenAI 兼容接口的 model 字段，例如 gpt-4o-mini、deepseek-chat 或本地网关里的模型名。",
-    "type": "string",
-    "default": ""
-  },
   "active_reply_enabled": {
     "description": "主动回复",
     "hint": "启用普通群聊中未被点名时的智能主动回复。",
@@ -60,8 +36,8 @@
     "default": true
   },
   "smart_segment_use_model": {
-    "description": "使用内部智能模型分析分段",
-    "hint": "开启后使用插件内部智能模型输出自然分段 JSON；如已配置自定义内部模型则优先使用自定义接口，否则使用当前会话模型。模型不可用、超时或返回不合规时退回本地自然分段。",
+    "description": "使用当前模型分析分段",
+    "hint": "开启后使用当前会话模型输出自然分段 JSON；模型不可用、超时或返回不合规时退回本地自然分段。",
     "type": "bool",
     "default": true
   },
@@ -73,7 +49,7 @@
   },
   "natural_rewrite_use_model": {
     "description": "使用模型自然改写",
-    "hint": "开启后会在回复生成后再调用一次内部智能模型做自然化整理，效果更细但会增加一次模型等待。默认关闭，仅用本地规则清理动作描写、标题和基础分段。",
+    "hint": "开启后会在回复生成后再调用一次当前会话模型做自然化整理，效果更细但会增加一次模型等待。默认关闭，仅用本地规则清理动作描写、标题和基础分段。",
     "type": "bool",
     "default": false
   },

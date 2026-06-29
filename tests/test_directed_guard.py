@@ -194,7 +194,6 @@ except ModuleNotFoundError:
     from astrbot.core.agent.tool import FunctionTool, ToolSet
     from astrbot.core.provider.entities import ProviderRequest
 
-import main as plugin_main
 from main import (
     EXTRA_DECISION,
     EXTRA_REASON,
@@ -310,16 +309,22 @@ async def _return_conversation(event):
 
 
 class FakeProvider:
-    def __init__(self, completion_text: str, *, delay: float = 0.0) -> None:
+    def __init__(self, completion_text: str | list[str], *, delay: float = 0.0) -> None:
         self.completion_text = completion_text
         self.delay = delay
         self.calls = []
 
     async def text_chat(self, **kwargs):
+        call_index = len(self.calls)
         self.calls.append(kwargs)
         if self.delay > 0:
             await asyncio.sleep(self.delay)
-        return types.SimpleNamespace(completion_text=self.completion_text)
+        if isinstance(self.completion_text, list):
+            index = min(call_index, len(self.completion_text) - 1)
+            text = self.completion_text[index]
+        else:
+            text = self.completion_text
+        return types.SimpleNamespace(completion_text=text)
 
 
 class FakeContext:
@@ -904,63 +909,17 @@ class DirectedReplyGuardTest(unittest.TestCase):
     def test_empty_exception_name_is_logged(self) -> None:
         self.assertEqual(_format_exception(TimeoutError()), "TimeoutError")
 
-    def test_custom_internal_model_is_used_for_llm_judge(self) -> None:
-        provider = FakeProvider("SKIP")
-        plugin = build_plugin(
-            {
-                "custom_ai_enabled": True,
-                "custom_ai_api_base": "https://custom.example/v1",
-                "custom_ai_api_key": "test-key",
-                "custom_ai_model": "judge-model",
-            },
-        )
+    def test_internal_model_uses_current_provider_for_llm_judge(self) -> None:
+        provider = FakeProvider("REPLY")
+        plugin = build_plugin({})
         plugin.context = FakeContext(provider)
         event = FakeEvent(group_id="group-a", sender_id="user-a")
-        calls = []
 
-        async def fake_post(**kwargs):
-            calls.append(kwargs)
-            return "REPLY"
-
-        original = plugin_main._post_openai_chat_completion
-        plugin_main._post_openai_chat_completion = fake_post
-        try:
-            decision = asyncio.run(plugin._llm_decide(event, "小昭，这个要怎么处理？"))
-        finally:
-            plugin_main._post_openai_chat_completion = original
+        decision = asyncio.run(plugin._llm_decide(event, "小昭，这个要怎么处理？"))
 
         self.assertEqual(decision, "REPLY")
-        self.assertEqual(provider.calls, [])
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["api_base"], "https://custom.example/v1")
-        self.assertEqual(calls[0]["api_key"], "test-key")
-        self.assertEqual(calls[0]["model"], "judge-model")
-
-    def test_custom_internal_model_failure_falls_back_to_current_provider(self) -> None:
-        provider = FakeProvider("SKIP")
-        plugin = build_plugin(
-            {
-                "custom_ai_enabled": True,
-                "custom_ai_api_base": "https://custom.example/v1",
-                "custom_ai_api_key": "test-key",
-                "custom_ai_model": "judge-model",
-            },
-        )
-        plugin.context = FakeContext(provider)
-        event = FakeEvent(group_id="group-a", sender_id="user-a")
-
-        async def fake_post(**kwargs):
-            raise RuntimeError("custom endpoint unavailable")
-
-        original = plugin_main._post_openai_chat_completion
-        plugin_main._post_openai_chat_completion = fake_post
-        try:
-            decision = asyncio.run(plugin._llm_decide(event, "小昭，这个要怎么处理？"))
-        finally:
-            plugin_main._post_openai_chat_completion = original
-
-        self.assertEqual(decision, "SKIP")
         self.assertEqual(len(provider.calls), 1)
+        self.assertIn("REPLY 或 SKIP", provider.calls[0]["system_prompt"])
 
     def test_character_action_output_is_stripped_by_default(self) -> None:
         self.assertEqual(
@@ -982,6 +941,10 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertEqual(
             _strip_character_action_output("（安安静静，没有任何回应）"),
             "",
+        )
+        self.assertEqual(
+            _strip_character_action_output("（小声嘀咕）反正小昭觉得他不太靠谱。"),
+            "反正小昭觉得他不太靠谱。",
         )
 
     def test_llm_response_action_cleanup_can_be_disabled(self) -> None:
@@ -1172,14 +1135,17 @@ class DirectedReplyGuardTest(unittest.TestCase):
             )
 
         plugin = build_plugin({})
-        provider = FakeProvider("不应该调用")
+        provider = FakeProvider(
+            '{"ok": true, "fixed": "收到测试信号喵～！小昭状态报告：系统正常、动作括号运行稳定、护主模块待命中、可爱值满格！\\n\\n主人尽管放心，小昭随时在线，不会掉链子的喵～❤️"}',
+        )
         plugin.context = FakeContext(provider)
         event = FakeEvent(group_id="private-a", sender_id="user-a")
         resp = Response()
 
         asyncio.run(plugin.clean_llm_response_actions(event, resp))
 
-        self.assertEqual(provider.calls, [])
+        self.assertEqual(len(provider.calls), 1)
+        self.assertIn("清理质检", provider.calls[0]["system_prompt"])
         self.assertNotIn("（", resp.completion_text)
         self.assertNotIn("眼睛亮晶晶", resp.completion_text)
         self.assertIn("\n\n", resp.completion_text)
@@ -1195,7 +1161,12 @@ class DirectedReplyGuardTest(unittest.TestCase):
         class Response:
             completion_text = "收到测试信号喵～！小昭状态报告：系统正常。（眼睛亮晶晶地看着主人）"
 
-        provider = FakeProvider("收到测试信号喵～！\n\n小昭状态报告：系统正常。")
+        provider = FakeProvider(
+            [
+                "收到测试信号喵～！\n\n小昭状态报告：系统正常。",
+                '{"ok": true, "fixed": "收到测试信号喵～！\\n\\n小昭状态报告：系统正常。"}',
+            ],
+        )
         plugin = build_plugin({"natural_rewrite_use_model": True})
         plugin.context = FakeContext(provider)
         event = FakeEvent(group_id="private-a", sender_id="user-a")
@@ -1203,15 +1174,19 @@ class DirectedReplyGuardTest(unittest.TestCase):
 
         asyncio.run(plugin.clean_llm_response_actions(event, resp))
 
-        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(len(provider.calls), 2)
         self.assertIn("只调整格式", provider.calls[0]["system_prompt"])
+        self.assertIn("清理质检", provider.calls[1]["system_prompt"])
         self.assertEqual(resp.completion_text, "收到测试信号喵～！\n\n小昭状态报告：系统正常。")
 
-    def test_model_rewrite_is_cleaned_again_before_response_is_used(self) -> None:
+    def test_model_rewrite_that_drops_prefix_falls_back_to_local_text(self) -> None:
         class Response:
-            completion_text = "那我先不打扰啦。"
+            completion_text = (
+                "要说坏蛋的话……那个人吧，老改名字，还一直试图套近乎、问东问西的。"
+                "反正小昭觉得他不太靠谱。"
+            )
 
-        provider = FakeProvider("（安安静静，没有任何回应）")
+        provider = FakeProvider("的话……那个人吧，老改名字，还一直试图套近乎、问东问西的。")
         plugin = build_plugin({"natural_rewrite_use_model": True})
         plugin.context = FakeContext(provider)
         event = FakeEvent(group_id="private-a", sender_id="user-a")
@@ -1220,7 +1195,50 @@ class DirectedReplyGuardTest(unittest.TestCase):
         asyncio.run(plugin.clean_llm_response_actions(event, resp))
 
         self.assertEqual(len(provider.calls), 1)
-        self.assertEqual(resp.completion_text, "嗯。")
+        self.assertTrue(resp.completion_text.startswith("要说坏蛋的话"))
+        self.assertIn("反正小昭觉得他不太靠谱。", resp.completion_text)
+
+    def test_action_cleanup_model_review_validates_cleaned_reply(self) -> None:
+        class Response:
+            completion_text = (
+                "那个人吧，老改名字，还一直试图套近乎、问东问西的。"
+                "（小声嘀咕）反正小昭觉得他不太靠谱。"
+            )
+
+        provider = FakeProvider(
+            '{"ok": true, "fixed": "那个人吧，老改名字，还一直试图套近乎、问东问西的。反正小昭觉得他不太靠谱。"}',
+        )
+        plugin = build_plugin({})
+        plugin.context = FakeContext(provider)
+        event = FakeEvent(group_id="private-a", sender_id="user-a")
+        resp = Response()
+
+        asyncio.run(plugin.clean_llm_response_actions(event, resp))
+
+        self.assertEqual(len(provider.calls), 1)
+        self.assertIn("清理质检", provider.calls[0]["system_prompt"])
+        self.assertNotIn("小声嘀咕", resp.completion_text)
+        self.assertIn("反正小昭觉得他不太靠谱。", resp.completion_text)
+
+    def test_action_cleanup_model_review_rejects_incomplete_fix(self) -> None:
+        class Response:
+            completion_text = (
+                "要说坏蛋的话……那个人吧，老改名字，还一直试图套近乎、问东问西的。"
+                "（小声嘀咕）反正小昭觉得他不太靠谱。"
+            )
+
+        provider = FakeProvider('{"ok": false, "fixed": "的话……那个人吧，老改名字。"}')
+        plugin = build_plugin({})
+        plugin.context = FakeContext(provider)
+        event = FakeEvent(group_id="private-a", sender_id="user-a")
+        resp = Response()
+
+        asyncio.run(plugin.clean_llm_response_actions(event, resp))
+
+        self.assertEqual(len(provider.calls), 1)
+        self.assertTrue(resp.completion_text.startswith("要说坏蛋的话"))
+        self.assertIn("反正小昭觉得他不太靠谱。", resp.completion_text)
+        self.assertNotIn("小声嘀咕", resp.completion_text)
 
     def test_final_reply_cleanup_removes_short_action_only_result(self) -> None:
         self.assertEqual(_strip_final_reply_text("（安安静静，没有任何回应）"), "")

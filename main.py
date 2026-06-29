@@ -4,8 +4,6 @@ import asyncio
 import json
 import random
 import re
-import urllib.error
-import urllib.request
 from collections.abc import AsyncGenerator, Iterable
 from time import monotonic
 
@@ -61,6 +59,15 @@ ACTION_OUTPUT_KEYWORDS = (
     "清了清嗓子",
     "安静",
     "沉默",
+    "小声",
+    "低声",
+    "轻声",
+    "嘀咕",
+    "嘟囔",
+    "喃喃",
+    "跑过来",
+    "趴着",
+    "哒哒",
     "没有回应",
     "没有任何回应",
     "不回应",
@@ -534,6 +541,49 @@ def _normalise_segment_text(text: str) -> str:
     return re.sub(r"\s+", "", text)
 
 
+def _should_review_action_cleanup(original: str, cleaned: str) -> bool:
+    if cleaned == original:
+        return False
+    if _is_structured_or_technical_reply(original):
+        return False
+    return _strip_final_reply_text(original) != original
+
+
+def _normalise_cleanup_review(original: str, cleaned: str, raw: str) -> str | None:
+    data = _extract_segment_json(raw)
+    if not isinstance(data, dict):
+        return None
+    fixed = data.get("fixed")
+    if not isinstance(fixed, str):
+        return None
+    fixed = _strip_final_reply_text(fixed)
+    if not fixed:
+        return None
+    if not _is_usable_rewrite(original, fixed):
+        return None
+    if not _cleanup_keeps_core_text(original, fixed):
+        return None
+    return fixed
+
+
+def _cleanup_keeps_core_text(original: str, cleaned: str) -> bool:
+    original_core = _normalise_cleanup_compare_text(original)
+    cleaned_core = _normalise_cleanup_compare_text(cleaned)
+    if not cleaned_core:
+        return not original_core
+    if original_core == cleaned_core:
+        return True
+    if cleaned_core in original_core and len(cleaned_core) >= max(8, int(len(original_core) * 0.75)):
+        return True
+    return False
+
+
+def _normalise_cleanup_compare_text(text: str) -> str:
+    text = _strip_final_reply_text(text or "")
+    text = _strip_markdown_emphasis(text)
+    return re.sub(r"\s+", "", text)
+
+
 def _strip_markdown_emphasis(text: str) -> str:
     previous = None
     current = text
@@ -541,76 +591,6 @@ def _strip_markdown_emphasis(text: str) -> str:
         previous = current
         current = MARKDOWN_EMPHASIS_RE.sub(r"\1", current)
     return current
-
-
-def _normalise_chat_completions_url(api_base: str) -> str:
-    base = api_base.strip().rstrip("/")
-    if base.endswith("/chat/completions"):
-        return base
-    if base.endswith("/v1"):
-        return f"{base}/chat/completions"
-    return f"{base}/v1/chat/completions"
-
-
-def _extract_openai_completion_text(body: dict) -> str:
-    choices = body.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return ""
-    first = choices[0]
-    if not isinstance(first, dict):
-        return ""
-    message = first.get("message")
-    if isinstance(message, dict):
-        content = message.get("content")
-        if content is not None:
-            return str(content)
-    text = first.get("text")
-    if text is not None:
-        return str(text)
-    return ""
-
-
-async def _post_openai_chat_completion(
-    *,
-    api_base: str,
-    api_key: str,
-    model: str,
-    prompt: str,
-    system_prompt: str,
-    timeout: float,
-    temperature: float = 0,
-) -> str:
-    url = _normalise_chat_completions_url(api_base)
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": temperature,
-    }
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    def request() -> str:
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read(512).decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
-        body = json.loads(raw)
-        if not isinstance(body, dict):
-            return ""
-        return _extract_openai_completion_text(body).strip()
-
-    return await asyncio.to_thread(request)
 
 
 def _resolve_mention_keywords(config) -> list[str]:
@@ -676,10 +656,6 @@ class Main(Star):
         global RUNTIME_ALIASES
         self.use_llm_judge = bool(self.config.get("use_llm_judge", True))
         self.judge_timeout_sec = float(self.config.get("judge_timeout_sec", 8))
-        self.custom_ai_enabled = bool(self.config.get("custom_ai_enabled", False))
-        self.custom_ai_api_base = str(self.config.get("custom_ai_api_base") or "").strip()
-        self.custom_ai_api_key = str(self.config.get("custom_ai_api_key") or "").strip()
-        self.custom_ai_model = str(self.config.get("custom_ai_model") or "").strip()
         self.active_reply_enabled = bool(self.config.get("active_reply_enabled", True))
         self.active_reply_cooldown_sec = float(
             self.config.get("active_reply_cooldown_sec", 30),
@@ -1152,6 +1128,7 @@ class Main(Star):
                 cleaned,
                 self.natural_chat_max_sentences,
             )
+        cleaned = await self._review_action_cleanup(event, text, cleaned)
         if cleaned == text:
             return
 
@@ -1161,13 +1138,6 @@ class Main(Star):
             PLUGIN_TAG,
             _safe_event_value(event, "get_group_id", "unknown"),
             _safe_event_value(event, "get_sender_id", "unknown"),
-        )
-
-    def _custom_ai_ready(self) -> bool:
-        return (
-            self.custom_ai_enabled
-            and bool(self.custom_ai_api_base)
-            and bool(self.custom_ai_model)
         )
 
     def _get_current_provider(self, event: AstrMessageEvent):
@@ -1184,31 +1154,8 @@ class Main(Star):
         system_prompt: str,
         timeout: float,
     ) -> str | None:
-        custom_exc: Exception | None = None
-        if self._custom_ai_ready():
-            try:
-                text = await _post_openai_chat_completion(
-                    api_base=self.custom_ai_api_base,
-                    api_key=self.custom_ai_api_key,
-                    model=self.custom_ai_model,
-                    prompt=prompt,
-                    system_prompt=system_prompt,
-                    timeout=timeout,
-                )
-                if text:
-                    return text
-            except Exception as exc:
-                custom_exc = exc
-                logger.warning(
-                    "%s custom ai failed, fallback to current provider: %s",
-                    PLUGIN_TAG,
-                    _format_exception(exc),
-                )
-
         provider = self._get_current_provider(event)
         if provider is None:
-            if custom_exc is not None:
-                raise custom_exc
             return None
 
         resp = await asyncio.wait_for(
@@ -1221,6 +1168,42 @@ class Main(Star):
             timeout=timeout,
         )
         return (getattr(resp, "completion_text", "") or "").strip()
+
+    async def _review_action_cleanup(
+        self,
+        event: AstrMessageEvent,
+        original: str,
+        cleaned: str,
+    ) -> str:
+        if not cleaned or not _should_review_action_cleanup(original, cleaned):
+            return cleaned
+
+        prompt = (
+            "请对一次聊天回复清理结果做质检。\n"
+            "目标：删除括号动作描写、舞台旁白、身体动作描述，同时保留原回复的信息和语气。\n"
+            "如果清理后仍有动作描写，或开头/结尾变残缺，或遗漏了原回复的实质内容，请给出修正版。\n"
+            "修正版只能删除动作/旁白和整理格式，不得新增事实，不得改称呼，不得改立场。\n"
+            "只输出 JSON：{\"ok\": true, \"fixed\": \"清理后的回复\"} 或 {\"ok\": false, \"fixed\": \"修正版\"}。\n\n"
+            f"原回复：\n{original}\n\n"
+            f"当前清理结果：\n{cleaned}"
+        )
+        try:
+            raw = await self._call_internal_model(
+                event,
+                prompt=prompt,
+                system_prompt="你是回复清理质检器，只输出 JSON，不输出解释。",
+                timeout=min(self.judge_timeout_sec, self.natural_rewrite_timeout_sec),
+            )
+        except Exception as exc:
+            logger.debug(
+                "%s action cleanup review failed: %s",
+                PLUGIN_TAG,
+                _format_exception(exc),
+            )
+            return cleaned
+
+        fixed = _normalise_cleanup_review(original, cleaned, raw or "")
+        return fixed or cleaned
 
     async def _rewrite_reply_naturally(
         self,
@@ -1272,7 +1255,7 @@ class Main(Star):
 
         text = plain.strip()
         if not self.action_output_enabled:
-            text = self._clean_plain_result_before_send(event, result, text)
+            text = await self._clean_plain_result_before_send(event, result, text)
         if not self._should_take_over_segment_send(event):
             return
         if len(text) < 45 or _is_technical_or_code_reply(text):
@@ -1316,13 +1299,14 @@ class Main(Star):
             len(segments),
         )
 
-    def _clean_plain_result_before_send(
+    async def _clean_plain_result_before_send(
         self,
         event: AstrMessageEvent,
         result,
         text: str,
     ) -> str:
         cleaned_text = _strip_final_reply_text(text)
+        cleaned_text = await self._review_action_cleanup(event, text, cleaned_text)
         if cleaned_text == text:
             return text
 
@@ -1956,6 +1940,8 @@ def _is_usable_rewrite(original: str, rewritten: str) -> bool:
         return False
     lowered = rewritten.lower()
     if lowered.startswith(("整理后的", "以下是", "好的", "可以，")):
+        return False
+    if not _cleanup_keeps_core_text(original, rewritten):
         return False
     return True
 
