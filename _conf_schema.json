@@ -115,9 +115,33 @@
   },
   "followup_llm_judge_enabled": {
     "description": "模型判断续聊",
-    "hint": "开启后，续聊窗口内同一发送者即使没有命中固定追问词，也会交给当前模型判断是否是在继续和机器人对话；关闭后只按固定续聊规则触发。",
+    "hint": "开启后，续聊窗口内同一发送者即使没有命中固定追问词，也会交给当前模型辅助打分；关闭后只按固定续聊规则触发。",
     "type": "bool",
     "default": true
+  },
+  "followup_score_threshold": {
+    "description": "续聊触发分数",
+    "hint": "模型辅助续聊的最终触发阈值。分数越高越保守；短反馈和普通陈述会扣分，模型只提供有限加分。",
+    "type": "int",
+    "default": 75
+  },
+  "followup_model_weight": {
+    "description": "续聊模型加分",
+    "hint": "模型判断像续聊时增加的分数。它不会一票通过，最终仍需达到续聊触发分数。",
+    "type": "int",
+    "default": 30
+  },
+  "followup_max_auto_rounds": {
+    "description": "无唤醒续聊轮数",
+    "hint": "一次点名或关键词触发后，允许连续无唤醒词续聊的最多轮数；设为 0 不限制。",
+    "type": "int",
+    "default": 2
+  },
+  "followup_score_weights": {
+    "description": "续聊评分权重",
+    "hint": "JSON 格式的续聊打分项。可覆盖 same_sender_window、explicit_followup_cue、question_mark、asks_bot_or_you、mentions_previous_reply、short_ack、plain_statement、long_elapsed、model_reply。",
+    "type": "string",
+    "default": "{\"same_sender_window\":20,\"explicit_followup_cue\":45,\"question_mark\":25,\"asks_bot_or_you\":25,\"mentions_previous_reply\":25,\"short_ack\":-60,\"plain_statement\":-20,\"long_elapsed\":-25,\"model_reply\":30}"
   },
   "active_judge_attempt_cooldown_sec": {
     "description": "主动判定间隔（秒）",

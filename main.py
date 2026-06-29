@@ -127,6 +127,29 @@ DEFAULT_FOLLOWUP_REPLY_CUE_PATTERNS = [
     r"(?:你觉得|你认为|你猜|猜一下|选一个|到底|所以|那你|那么)",
     r"(?:不是|不对|我是说|我问的是|别绕|别跑题|刚才|上一句)",
 ]
+DEFAULT_FOLLOWUP_SCORE_WEIGHTS = {
+    "same_sender_window": 20,
+    "explicit_followup_cue": 45,
+    "question_mark": 25,
+    "asks_bot_or_you": 25,
+    "mentions_previous_reply": 25,
+    "short_ack": -60,
+    "plain_statement": -20,
+    "long_elapsed": -25,
+    "model_reply": 30,
+}
+FOLLOWUP_ASKS_BOT_RE = re.compile(
+    r"(?:你|小昭|bot|机器人|怎么|咋|如何|为什么|为啥|啥|什么|哪个|多少|几点|能不能|可不可以)",
+    re.IGNORECASE,
+)
+FOLLOWUP_PREVIOUS_REPLY_RE = re.compile(
+    r"(?:刚才|上面|上一句|前面|你说|你刚|这个|那个|这样|那|然后|继续|接着|展开)",
+    re.IGNORECASE,
+)
+FOLLOWUP_SHORT_ACK_RE = re.compile(
+    r"^(?:好|好的|好吧|嗯|嗯嗯|哦|噢|喔|行|可以|收到|懂了|明白|了解|ok|OK|通过|测试通过|哈哈|笑死|确实|是的|对|对的|没事|算了)[。.!！~～]*$",
+    re.IGNORECASE,
+)
 
 
 def _dedupe(items: Iterable[str]) -> list[str]:
@@ -172,6 +195,22 @@ def _as_int(value, fallback: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _as_int_dict(value, fallback: dict[str, int]) -> dict[str, int]:
+    result = dict(fallback)
+    if isinstance(value, str) and value.strip():
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return result
+    if not isinstance(value, dict):
+        return result
+    for key, raw in value.items():
+        if key not in result:
+            continue
+        result[key] = _as_int(raw, result[key])
+    return result
 
 
 def _looks_like_character_action(text: str) -> bool:
@@ -672,6 +711,25 @@ class Main(Star):
         self.followup_llm_judge_enabled = bool(
             self.config.get("followup_llm_judge_enabled", True),
         )
+        self.followup_score_threshold = _as_int(
+            self.config.get("followup_score_threshold"),
+            75,
+        )
+        self.followup_model_weight = _as_int(
+            self.config.get("followup_model_weight"),
+            DEFAULT_FOLLOWUP_SCORE_WEIGHTS["model_reply"],
+        )
+        self.followup_max_auto_rounds = max(
+            0,
+            _as_int(self.config.get("followup_max_auto_rounds"), 2),
+        )
+        self.followup_score_weights = _as_int_dict(
+            self.config.get("followup_score_weights"),
+            {
+                **DEFAULT_FOLLOWUP_SCORE_WEIGHTS,
+                "model_reply": self.followup_model_weight,
+            },
+        )
         self.active_judge_attempt_cooldown_sec = _as_float(
             self.config.get("active_judge_attempt_cooldown_sec"),
             45,
@@ -726,6 +784,7 @@ class Main(Star):
         self._last_directed_group_at: dict[str, float] = {}
         self._last_directed_sender_at: dict[str, float] = {}
         self._last_followup_target_at: dict[str, float] = {}
+        self._followup_auto_rounds: dict[str, int] = {}
 
     async def initialize(self) -> None:
         logger.info(
@@ -847,6 +906,9 @@ class Main(Star):
             return
         if _contains_keyword(text, self.mention_keywords):
             return
+        if self._is_followup_auto_round_limited(event):
+            logger.debug("%s active skip: followup_auto_round_limit", PLUGIN_TAG)
+            return
         followup_allowed, followup_reason = self._recent_followup_reply_reason(
             event,
             text,
@@ -857,14 +919,14 @@ class Main(Star):
             and self.followup_llm_judge_enabled
         ):
             followup_decision = await self._followup_decide(event, text)
-            if followup_decision == "REPLY":
+            score, score_reasons = self._score_followup_reply(
+                event,
+                text,
+                model_replied=followup_decision == "REPLY",
+            )
+            if score >= self.followup_score_threshold:
                 followup_allowed = True
-                followup_reason = self._recent_followup_reply_reason(
-                    event,
-                    text,
-                    require_cue=False,
-                    reason_prefix="followup_llm_judge",
-                )[1]
+                followup_reason = f"followup_score:{score}/{self.followup_score_threshold}:{','.join(score_reasons)}"
         if followup_allowed:
             cooling_down, cooldown_reason = self._is_active_reply_cooldown_active(event)
             if cooling_down:
@@ -874,6 +936,7 @@ class Main(Star):
                 event,
                 text,
                 followup_reason,
+                followup_auto=True,
             )
             if request is None:
                 return
@@ -926,6 +989,8 @@ class Main(Star):
         event: AstrMessageEvent,
         text: str,
         reason: str,
+        *,
+        followup_auto: bool = False,
     ) -> ProviderRequest | None:
         conversation = await self._get_or_create_conversation(event)
         if conversation is None:
@@ -936,7 +1001,9 @@ class Main(Star):
         event.set_extra(EXTRA_REASON, reason)
         event.set_extra(EXTRA_MODE, "active_reply")
         self._last_active_reply_at[cooldown_key] = monotonic()
-        self._record_followup_target(event)
+        self._record_followup_target(event, reset_rounds=not followup_auto)
+        if followup_auto:
+            self._record_followup_auto_round(event)
 
         logger.info(
             "%s active reply: group=%s sender=%s reason=%s text=%s",
@@ -1457,11 +1524,86 @@ class Main(Star):
         event: AstrMessageEvent,
         *,
         now: float | None = None,
+        reset_rounds: bool = True,
     ) -> None:
         if self.followup_reply_window_sec <= 0:
             return
         now = monotonic() if now is None else now
-        self._last_followup_target_at[self._followup_reply_key(event)] = now
+        key = self._followup_reply_key(event)
+        self._last_followup_target_at[key] = now
+        if reset_rounds:
+            self._followup_auto_rounds[key] = 0
+
+    def _record_followup_auto_round(self, event: AstrMessageEvent) -> None:
+        key = self._followup_reply_key(event)
+        self._followup_auto_rounds[key] = self._followup_auto_rounds.get(key, 0) + 1
+
+    def _is_followup_auto_round_limited(self, event: AstrMessageEvent) -> bool:
+        if self.followup_max_auto_rounds <= 0:
+            return False
+        key = self._followup_reply_key(event)
+        last_target_at = self._last_followup_target_at.get(key)
+        if last_target_at is None:
+            return False
+        if monotonic() - last_target_at > self.followup_reply_window_sec:
+            return False
+        return self._followup_auto_rounds.get(key, 0) >= self.followup_max_auto_rounds
+
+    def _score_followup_reply(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        *,
+        model_replied: bool = False,
+        now: float | None = None,
+    ) -> tuple[int, list[str]]:
+        now = monotonic() if now is None else now
+        key = self._followup_reply_key(event)
+        last_target_at = self._last_followup_target_at.get(key)
+        if last_target_at is None:
+            return 0, ["no_target"]
+
+        elapsed = now - last_target_at
+        if elapsed > self.followup_reply_window_sec:
+            return 0, ["expired"]
+
+        compact = re.sub(r"\s+", "", text or "")
+        weights = self.followup_score_weights
+        score = weights.get("same_sender_window", 0)
+        reasons = ["same_sender_window"]
+
+        if self._has_followup_reply_cue(text):
+            score += weights.get("explicit_followup_cue", 0)
+            reasons.append("explicit_followup_cue")
+        if re.search(r"[?？]", text):
+            score += weights.get("question_mark", 0)
+            reasons.append("question_mark")
+        if FOLLOWUP_ASKS_BOT_RE.search(text):
+            score += weights.get("asks_bot_or_you", 0)
+            reasons.append("asks_bot_or_you")
+        if FOLLOWUP_PREVIOUS_REPLY_RE.search(text):
+            score += weights.get("mentions_previous_reply", 0)
+            reasons.append("mentions_previous_reply")
+        if FOLLOWUP_SHORT_ACK_RE.fullmatch(compact):
+            score += weights.get("short_ack", 0)
+            reasons.append("short_ack")
+        elif (
+            len(compact) >= 6
+            and not re.search(r"[?？]", text)
+            and not self._has_followup_reply_cue(text)
+            and not FOLLOWUP_ASKS_BOT_RE.search(text)
+            and not FOLLOWUP_PREVIOUS_REPLY_RE.search(text)
+        ):
+            score += weights.get("plain_statement", 0)
+            reasons.append("plain_statement")
+        if elapsed > self.followup_reply_window_sec * 0.55:
+            score += weights.get("long_elapsed", 0)
+            reasons.append("long_elapsed")
+        if model_replied:
+            score += weights.get("model_reply", self.followup_model_weight)
+            reasons.append("model_reply")
+
+        return score, reasons
 
     def _recent_followup_reply_reason(
         self,
