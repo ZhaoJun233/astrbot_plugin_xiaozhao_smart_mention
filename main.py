@@ -669,6 +669,9 @@ class Main(Star):
             self.config.get("followup_reply_window_sec"),
             180,
         )
+        self.followup_llm_judge_enabled = bool(
+            self.config.get("followup_llm_judge_enabled", True),
+        )
         self.active_judge_attempt_cooldown_sec = _as_float(
             self.config.get("active_judge_attempt_cooldown_sec"),
             45,
@@ -848,6 +851,20 @@ class Main(Star):
             event,
             text,
         )
+        if (
+            not followup_allowed
+            and followup_reason == "no_followup_reply_cue"
+            and self.followup_llm_judge_enabled
+        ):
+            followup_decision = await self._followup_decide(event, text)
+            if followup_decision == "REPLY":
+                followup_allowed = True
+                followup_reason = self._recent_followup_reply_reason(
+                    event,
+                    text,
+                    require_cue=False,
+                    reason_prefix="followup_llm_judge",
+                )[1]
         if followup_allowed:
             cooling_down, cooldown_reason = self._is_active_reply_cooldown_active(event)
             if cooling_down:
@@ -1452,10 +1469,12 @@ class Main(Star):
         text: str,
         *,
         now: float | None = None,
+        require_cue: bool = True,
+        reason_prefix: str = "followup_window",
     ) -> tuple[bool, str]:
         if self.followup_reply_window_sec <= 0:
             return False, "followup_disabled"
-        if not self._has_followup_reply_cue(text):
+        if require_cue and not self._has_followup_reply_cue(text):
             return False, "no_followup_reply_cue"
 
         now = monotonic() if now is None else now
@@ -1468,7 +1487,7 @@ class Main(Star):
         if elapsed <= self.followup_reply_window_sec:
             return (
                 True,
-                f"followup_window:{elapsed:.1f}/{self.followup_reply_window_sec:.1f}s",
+                f"{reason_prefix}:{elapsed:.1f}/{self.followup_reply_window_sec:.1f}s",
             )
         return False, f"followup_expired:{elapsed:.1f}/{self.followup_reply_window_sec:.1f}s"
 
@@ -1531,6 +1550,51 @@ class Main(Star):
             self._record_judge_failure(event, "llm", exc)
             logger.warning(
                 "%s llm judge failed: %s",
+                PLUGIN_TAG,
+                _format_exception(exc),
+            )
+            return None
+
+        answer = (answer or "").strip().upper()
+        if "REPLY" in answer and "SKIP" not in answer:
+            return "REPLY"
+        if "SKIP" in answer and "REPLY" not in answer:
+            return "SKIP"
+        return None
+
+    async def _followup_decide(self, event: AstrMessageEvent, text: str) -> str | None:
+        bot_label = self._primary_mention_keyword()
+        recent_context = self._recent_group_context(event)
+        context_block = (
+            f"最近群聊上下文:\n{recent_context}\n\n" if recent_context else ""
+        )
+        prompt = (
+            f"你是群聊机器人“{bot_label}”的连续对话判定器。"
+            f"同一发言人刚和{bot_label}对话过，现在没有再次点名。"
+            f"请判断这条消息是不是仍在接着对{bot_label}说。\n"
+            "输出 REPLY 的情况：追问、补充说明、纠正上一句、表达对上一轮回复的反应、"
+            "短句但明显是在等机器人继续接话。\n"
+            "输出 SKIP 的情况：转而和群里其他人聊天、普通感叹或表情、开启了新话题但没有邀请机器人、"
+            "接话会显得突兀或抢话。\n"
+            "只能输出 REPLY 或 SKIP，不要输出其他内容。\n\n"
+            f"群号: {event.get_group_id()}\n"
+            f"发言人ID: {event.get_sender_id()}\n"
+            f"发言人昵称: {event.get_sender_name()}\n"
+            f"{context_block}"
+            f"当前消息: {text}\n"
+        )
+
+        try:
+            answer = await self._call_internal_model(
+                event,
+                prompt=prompt,
+                system_prompt="你只输出 REPLY 或 SKIP。",
+                timeout=self.judge_timeout_sec,
+            )
+        except Exception as exc:
+            self._record_judge_failure(event, "followup", exc)
+            logger.warning(
+                "%s followup judge failed: %s",
                 PLUGIN_TAG,
                 _format_exception(exc),
             )

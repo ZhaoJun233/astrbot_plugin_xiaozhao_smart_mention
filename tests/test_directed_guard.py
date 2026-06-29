@@ -300,6 +300,10 @@ async def _return_skip(event, text):
     return "SKIP"
 
 
+async def _return_reply(event, text):
+    return "REPLY"
+
+
 async def _return_conversation(event):
     return object()
 
@@ -594,7 +598,7 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertEqual(items, [])
         self.assertIsNone(other_sender.get_extra(EXTRA_DECISION))
 
-    def test_recent_followup_window_requires_followup_cue(self) -> None:
+    def test_recent_followup_window_uses_model_when_text_has_no_cue(self) -> None:
         plugin = build_plugin(
             {
                 "mention_keywords": ["小昭"],
@@ -602,6 +606,31 @@ class DirectedReplyGuardTest(unittest.TestCase):
             },
         )
         plugin._get_or_create_conversation = _return_conversation
+        plugin._followup_decide = _return_reply
+
+        first = FakeEvent(
+            group_id="group-a",
+            sender_id="user-a",
+            text="那小昭你觉得我是男孩子还是女孩子呢？",
+        )
+        asyncio.run(plugin.smart_mention(first))
+
+        casual = FakeEvent(group_id="group-a", sender_id="user-a", text="今天群里还挺热闹")
+        items = list(asyncio.run(_collect_async(plugin.smart_active_reply(casual))))
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(casual.get_extra(EXTRA_DECISION), "REPLY")
+        self.assertTrue(casual.get_extra(EXTRA_REASON).startswith("followup_llm_judge:"))
+
+    def test_recent_followup_window_respects_model_skip_without_cue(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "followup_reply_window_sec": 180,
+            },
+        )
+        plugin._get_or_create_conversation = _return_conversation
+        plugin._followup_decide = _return_skip
 
         first = FakeEvent(
             group_id="group-a",

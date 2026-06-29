@@ -113,6 +113,12 @@
     "type": "int",
     "default": 180
   },
+  "followup_llm_judge_enabled": {
+    "description": "模型判断续聊",
+    "hint": "开启后，续聊窗口内同一发送者即使没有命中固定追问词，也会交给当前模型判断是否是在继续和机器人对话；关闭后只按固定续聊规则触发。",
+    "type": "bool",
+    "default": true
+  },
   "active_judge_attempt_cooldown_sec": {
     "description": "主动判定间隔（秒）",
     "hint": "无关键词普通群聊消息进入主动回复判定的最短间隔；无论最终是否回复，都会避免频繁请求模型。",
