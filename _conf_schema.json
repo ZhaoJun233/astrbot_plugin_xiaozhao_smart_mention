@@ -157,7 +157,7 @@
   },
   "owner_ids": {
     "description": "主人 ID 列表",
-    "hint": "用于主人身份识别和绕过点名防刷屏冷却。仓库默认留空，请在本机配置里填写自己的平台用户 ID。",
+    "hint": "用于主人身份识别和绕过点名防刷屏冷却。OneBot 填 QQ 数字号；QQ Official 填 member_openid/user_openid，不是 QQ 号。仓库默认留空，请在本机配置里填写自己的平台用户 ID。",
     "type": "list",
     "default": []
   },

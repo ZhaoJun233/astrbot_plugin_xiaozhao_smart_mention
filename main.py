@@ -16,6 +16,11 @@ from astrbot.core.config import AstrBotConfig
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.star.filter.custom_filter import CustomFilter
 
+try:
+    from .platform_identity import event_identity, is_official_at_self
+except ImportError:
+    from platform_identity import event_identity, is_official_at_self
+
 
 PLUGIN_TAG = "[xiaozhao_smart_mention]"
 EXTRA_DECISION = "xiaozhao_smart_mention_decision"
@@ -1420,6 +1425,8 @@ class Main(Star):
         for comp in event.get_messages():
             if isinstance(comp, At) and str(comp.qq) in (self_id, "all"):
                 return True
+            if isinstance(comp, At) and is_official_at_self(event, str(comp.qq)):
+                return True
             if isinstance(comp, AtAll):
                 return True
             if isinstance(comp, Reply) and str(getattr(comp, "sender_id", "")) == self_id:
@@ -1432,7 +1439,7 @@ class Main(Star):
         )
 
     def _is_owner_message(self, event: AstrMessageEvent) -> bool:
-        return str(event.get_sender_id()) in self.owner_ids
+        return event_identity(event).sender_id in self.owner_ids
 
     def _consume_directed_reply_slot(
         self,
@@ -1479,10 +1486,11 @@ class Main(Star):
         return self._consume_directed_reply_slot(event)
 
     def _directed_group_key(self, event: AstrMessageEvent) -> str:
-        return f"{event.unified_msg_origin}:bot:{event.get_self_id()}"
+        identity = event_identity(event)
+        return f"{identity.bot_key}:group:{identity.group_id}"
 
     def _directed_sender_key(self, event: AstrMessageEvent) -> str:
-        return f"{self._directed_group_key(event)}:sender:{event.get_sender_id()}"
+        return f"{self._directed_group_key(event)}:sender:{event_identity(event).sender_id}"
 
     def _is_judge_backoff_active(
         self,
@@ -1540,7 +1548,8 @@ class Main(Star):
         return True, "allowed"
 
     def _judge_backoff_key(self, event: AstrMessageEvent) -> str:
-        return f"{event.unified_msg_origin}:bot:{event.get_self_id()}"
+        identity = event_identity(event)
+        return f"{identity.bot_key}:group:{identity.group_id}"
 
     def _active_judge_attempt_key(self, event: AstrMessageEvent) -> str:
         return self._judge_backoff_key(event)
@@ -1684,10 +1693,8 @@ class Main(Star):
         return False, f"followup_expired:{elapsed:.1f}/{self.followup_reply_window_sec:.1f}s"
 
     def _followup_reply_key(self, event: AstrMessageEvent) -> str:
-        return (
-            f"{event.unified_msg_origin}:bot:{event.get_self_id()}:"
-            f"sender:{event.get_sender_id()}"
-        )
+        identity = event_identity(event)
+        return f"{identity.bot_key}:group:{identity.group_id}:sender:{identity.sender_id}"
 
     async def _decide(self, event: AstrMessageEvent, text: str) -> tuple[str, str]:
         for pattern in self.skip_patterns:

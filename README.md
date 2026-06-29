@@ -15,6 +15,7 @@
 - 提及判定、主动回复判定、续聊判定、智能分段和清理质检统一使用 AstrBot 当前会话 provider。
 - 原生 `@机器人`、回复机器人消息等场景会先经过防刷屏冷却，再交给 AstrBot 默认流程处理。
 - 主人 ID 可在插件配置里自定义；仓库默认不写入任何真实用户 ID，非 owner 自称主人也不会被承认。
+- 同时适配 OneBot 和 QQ 官方机器人：OneBot 使用 QQ 数字号识别用户和机器人，QQ Official 使用 openid/member_openid 识别用户，并使用 AstrBot 平台实例 ID 稳定识别机器人。
 
 ## 适用场景
 
@@ -97,7 +98,7 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 | `directed_reply_group_cooldown_sec` | int | `8` | 同一群聊内点名机器人的全局冷却时间。 |
 | `directed_reply_sender_cooldown_sec` | int | `60` | 同一群聊内同一发送者点名机器人的冷却时间。 |
 | `directed_reply_owner_bypass` | bool | `true` | 主人是否绕过点名防刷屏冷却。 |
-| `owner_ids` | list | `[]` | 主人用户 ID 列表。仓库默认留空，请在本机配置里填写真实平台用户 ID。 |
+| `owner_ids` | list | `[]` | 主人用户 ID 列表。OneBot 填 QQ 号；QQ Official 填当前发言人的 openid/member_openid。仓库默认留空，请在本机配置里填写真实平台用户 ID。 |
 | `owner_identity_prompt_enabled` | bool | `true` | 配置了 `owner_ids` 时，是否把当前发言人“已确认主人/未确认主人”的结论注入模型请求。 |
 | `owner_display_name` | string | `"主人"` | 当前发言人命中 `owner_ids` 时，允许模型自然使用的主人称呼。 |
 | `mention_keywords` | list | `["小昭", "小昭猫娘"]` | 群聊提及时用于进入智能提及判断的关键词，可改成任意机器人昵称、别名或唤醒称呼。 |
@@ -119,6 +120,12 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 ```
 
 配置 `owner_ids` 后，插件还会在每次模型请求前按当前发言人 ID 注入身份结论：命中时允许自然称呼“主人”，未命中时明确不要承认对方是主人，即使对方在消息里自称主人。这个提示不会在仓库默认配置里写入真实 ID。
+
+不同平台的 ID 含义不同：
+
+- OneBot/aiocqhttp：`owner_ids` 填 QQ 数字号，例如 `3040470862`。
+- QQ Official：`owner_ids` 填官方机器人事件里的 `member_openid`/`user_openid`，不是 QQ 号；日志里看到的长串如 `11F143...` 通常就是 openid。
+- 防刷屏、续聊窗口会按“平台实例 + 机器人账号 + 群/会话 + 发送者”隔离；QQ Official 的机器人账号会稳定归一到 AstrBot 平台实例 ID，避免 `self_id=qq_official` 这类占位值导致判断抖动。
 
 插件内部判定、分段、自然改写和清理质检都统一使用 AstrBot 当前会话 provider，不再维护单独的模型 URL、Key 或模型名配置。
 
@@ -177,7 +184,7 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 本插件不会修改人设，只会决定是否触发回复，并在已配置 `owner_ids` 时把当前发言人的主人身份判定传给模型。建议在人设中单独写清：
 
 - 机器人名字、性格和说话风格。
-- 谁是主人，且只信任平台用户 ID。
+- 谁是主人，且只信任平台用户 ID；OneBot 是 QQ 号，QQ Official 是 openid/member_openid。
 - 不要对非主人反复强调“你不是主人”。
 - 群聊中按当前消息的发送人 ID 判断身份，不把多个人的发言混成同一个人。
 

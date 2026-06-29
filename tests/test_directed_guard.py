@@ -220,13 +220,19 @@ class FakeEvent:
         self_id: str = "bot-a",
         text: str = "",
         message_type: str = "GROUP_MESSAGE",
+        platform_name: str = "aiocqhttp",
+        platform_id: str = "qq_personal_onebot",
+        messages: list | None = None,
     ) -> None:
-        self.unified_msg_origin = f"aiocqhttp:GroupMessage:{group_id}"
+        self.unified_msg_origin = f"{platform_id}:GroupMessage:{group_id}"
         self._group_id = group_id
         self._sender_id = sender_id
         self._self_id = self_id
         self._text = text
         self._message_type = message_type
+        self._platform_name = platform_name
+        self._platform_id = platform_id
+        self._messages = messages or []
         self._extras = {}
         self._force_stopped = False
         self.is_at_or_wake_command = False
@@ -253,7 +259,7 @@ class FakeEvent:
         return self._message_type
 
     def get_messages(self) -> list:
-        return []
+        return self._messages
 
     def set_extra(self, key: str, value) -> None:
         self._extras[key] = value
@@ -265,7 +271,10 @@ class FakeEvent:
         return "sender"
 
     def get_platform_id(self) -> str:
-        return "qq"
+        return self._platform_id
+
+    def get_platform_name(self) -> str:
+        return self._platform_name
 
     def request_llm(self, **kwargs) -> ProviderRequest:
         return ProviderRequest(**kwargs)
@@ -414,6 +423,60 @@ class DirectedReplyGuardTest(unittest.TestCase):
 
         self.assertTrue(plugin._is_owner_message(FakeEvent(sender_id="owner-a")))
         self.assertFalse(plugin._is_owner_message(FakeEvent(sender_id="user-a")))
+
+    def test_qq_official_owner_id_uses_openid(self) -> None:
+        plugin = build_plugin({"owner_ids": ["member-openid-a"]})
+        event = FakeEvent(
+            platform_name="qq_official",
+            platform_id="default_1903757478",
+            group_id="group-openid-a",
+            sender_id="member-openid-a",
+            self_id="qq_official",
+        )
+
+        self.assertTrue(plugin._is_owner_message(event))
+        self.assertEqual(
+            plugin._directed_group_key(event),
+            "default_1903757478:bot:default_1903757478:group:group-openid-a",
+        )
+        self.assertEqual(
+            plugin._directed_sender_key(event),
+            "default_1903757478:bot:default_1903757478:group:group-openid-a:sender:member-openid-a",
+        )
+
+    def test_qq_official_at_marker_is_native_directed_signal(self) -> None:
+        from astrbot.api.message_components import At
+
+        plugin = build_plugin()
+        event = FakeEvent(
+            platform_name="qq_official",
+            platform_id="default_1903757478",
+            group_id="group-openid-a",
+            sender_id="member-openid-a",
+            self_id="qq_official",
+            messages=[At(qq="qq_official")],
+        )
+
+        self.assertTrue(plugin._has_native_directed_signal(event))
+
+    def test_onebot_identity_still_uses_numeric_bot_id(self) -> None:
+        plugin = build_plugin()
+        event = FakeEvent(
+            platform_name="aiocqhttp",
+            platform_id="qq_personal_onebot",
+            group_id="10001",
+            sender_id="3040470862",
+            self_id="123456789",
+        )
+
+        self.assertEqual(
+            plugin._directed_group_key(event),
+            "qq_personal_onebot:bot:123456789:group:10001",
+        )
+        self.assertEqual(
+            plugin._directed_sender_key(event),
+            "qq_personal_onebot:bot:123456789:group:10001:sender:3040470862",
+        )
 
     def test_active_judge_attempt_is_rate_limited(self) -> None:
         plugin = build_plugin({"active_judge_attempt_cooldown_sec": 45})
