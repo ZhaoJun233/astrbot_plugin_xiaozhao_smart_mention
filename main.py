@@ -59,6 +59,14 @@ ACTION_OUTPUT_KEYWORDS = (
     "炸毛",
     "脸红",
     "清了清嗓子",
+    "安静",
+    "沉默",
+    "没有回应",
+    "没有任何回应",
+    "不回应",
+    "无回应",
+    "不说话",
+    "不吭声",
 )
 ACTION_PARENS_RE = re.compile(r"[（(]([^（）()]{1,120})[）)]")
 ACTION_MARKDOWN_RE = re.compile(r"(?<!\*)\*([^*\n]{1,120})\*(?!\*)")
@@ -235,6 +243,12 @@ def _strip_character_action_output(text: str) -> str:
     cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
     cleaned = re.sub(r" {2,}", " ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _strip_final_reply_text(text: str) -> str:
+    cleaned = _strip_character_action_output(text)
+    cleaned = _strip_chatty_heading_output(cleaned)
     return cleaned.strip()
 
 
@@ -1129,11 +1143,10 @@ class Main(Star):
             return
 
         text = getattr(resp, "completion_text", "") or ""
-        cleaned = _strip_character_action_output(text)
-        if self.natural_chat_style_enabled:
-            cleaned = _strip_chatty_heading_output(cleaned)
+        cleaned = _strip_final_reply_text(text)
         if self.natural_chat_style_enabled and self.natural_rewrite_use_model:
             cleaned = await self._rewrite_reply_naturally(event, cleaned)
+            cleaned = _strip_final_reply_text(cleaned)
         elif self.natural_chat_style_enabled:
             cleaned = _format_natural_chat_paragraphs(
                 cleaned,
@@ -1249,9 +1262,6 @@ class Main(Star):
 
     @filter.on_decorating_result(priority=-80)
     async def send_natural_segments(self, event: AstrMessageEvent) -> None:
-        if not self._should_take_over_segment_send(event):
-            return
-
         result = event.get_result()
         if result is None or not getattr(result, "chain", None):
             return
@@ -1261,6 +1271,10 @@ class Main(Star):
             return
 
         text = plain.strip()
+        if not self.action_output_enabled:
+            text = self._clean_plain_result_before_send(event, result, text)
+        if not self._should_take_over_segment_send(event):
+            return
         if len(text) < 45 or _is_technical_or_code_reply(text):
             return
         if _looks_like_casual_numbered_list(text):
@@ -1301,6 +1315,26 @@ class Main(Star):
             _safe_event_value(event, "get_sender_id", "unknown"),
             len(segments),
         )
+
+    def _clean_plain_result_before_send(
+        self,
+        event: AstrMessageEvent,
+        result,
+        text: str,
+    ) -> str:
+        cleaned_text = _strip_final_reply_text(text)
+        if cleaned_text == text:
+            return text
+
+        cleaned_text = cleaned_text or "嗯。"
+        result.chain = [Plain(cleaned_text)]
+        logger.info(
+            "%s final action output stripped: group=%s sender=%s",
+            PLUGIN_TAG,
+            _safe_event_value(event, "get_group_id", "unknown"),
+            _safe_event_value(event, "get_sender_id", "unknown"),
+        )
+        return cleaned_text
 
     def _should_take_over_segment_send(self, event: AstrMessageEvent) -> bool:
         if not self.natural_chat_style_enabled or not self.smart_segment_enabled:

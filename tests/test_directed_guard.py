@@ -206,6 +206,7 @@ from main import (
     _normalise_model_segments,
     _stop_event_silently,
     _strip_character_action_output,
+    _strip_final_reply_text,
 )
 
 from astrbot.api.message_components import Plain
@@ -978,6 +979,10 @@ class DirectedReplyGuardTest(unittest.TestCase):
             _strip_character_action_output("*尾巴轻轻晃了晃* 好呀，小昭在呢。"),
             "好呀，小昭在呢。",
         )
+        self.assertEqual(
+            _strip_character_action_output("（安安静静，没有任何回应）"),
+            "",
+        )
 
     def test_llm_response_action_cleanup_can_be_disabled(self) -> None:
         class Response:
@@ -1201,6 +1206,35 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertEqual(len(provider.calls), 1)
         self.assertIn("只调整格式", provider.calls[0]["system_prompt"])
         self.assertEqual(resp.completion_text, "收到测试信号喵～！\n\n小昭状态报告：系统正常。")
+
+    def test_model_rewrite_is_cleaned_again_before_response_is_used(self) -> None:
+        class Response:
+            completion_text = "那我先不打扰啦。"
+
+        provider = FakeProvider("（安安静静，没有任何回应）")
+        plugin = build_plugin({"natural_rewrite_use_model": True})
+        plugin.context = FakeContext(provider)
+        event = FakeEvent(group_id="private-a", sender_id="user-a")
+        resp = Response()
+
+        asyncio.run(plugin.clean_llm_response_actions(event, resp))
+
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(resp.completion_text, "嗯。")
+
+    def test_final_reply_cleanup_removes_short_action_only_result(self) -> None:
+        self.assertEqual(_strip_final_reply_text("（安安静静，没有任何回应）"), "")
+
+    def test_decorating_result_final_cleanup_strips_short_action_reply(self) -> None:
+        plugin = build_plugin({"smart_segment_enabled": False})
+        event = FakeEvent(group_id="private-a", sender_id="user-a")
+        event.result = FakeResult([Plain("（安安静静，没有任何回应）")])
+
+        asyncio.run(plugin.send_natural_segments(event))
+
+        self.assertIsNotNone(event.result)
+        self.assertEqual(event.result.chain[0].text, "嗯。")
+        self.assertEqual(event.sent_messages, [])
 
     def test_real_test_reply_falls_back_to_local_formatting_without_provider(self) -> None:
         class Response:
