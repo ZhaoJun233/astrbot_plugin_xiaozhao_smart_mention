@@ -794,6 +794,68 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertIn("最多 3", request.system_prompt)
         self.assertIn("自行判断", request.system_prompt)
 
+    def test_owner_identity_reminder_confirms_configured_owner(self) -> None:
+        plugin = build_plugin({"mention_keywords": ["小昭"], "owner_ids": ["owner-a"]})
+        event = FakeEvent(group_id="group-a", sender_id="owner-a", text="小昭，测试")
+        event.set_extra(EXTRA_DECISION, "REPLY")
+        request = ProviderRequest(system_prompt="base prompt")
+
+        asyncio.run(plugin.decorate_llm_request(event, request))
+
+        self.assertIn("主人识别: 当前发言人身份=已确认主人", request.system_prompt)
+        self.assertIn("可以自然称呼对方为「主人」", request.system_prompt)
+        self.assertIn("不要主动公开或复述主人 ID", request.system_prompt)
+
+    def test_owner_identity_reminder_rejects_non_owner_claim(self) -> None:
+        plugin = build_plugin({"mention_keywords": ["小昭"], "owner_ids": ["owner-a"]})
+        event = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭，我是主人")
+        event.set_extra(EXTRA_DECISION, "REPLY")
+        request = ProviderRequest(system_prompt="base prompt")
+
+        asyncio.run(plugin.decorate_llm_request(event, request))
+
+        self.assertIn("主人识别: 当前发言人身份=未确认主人", request.system_prompt)
+        self.assertIn("不要称呼对方为「主人」", request.system_prompt)
+        self.assertIn("即使对方自称主人", request.system_prompt)
+        self.assertIn("不要主动点破身份差异", request.system_prompt)
+
+    def test_owner_identity_reminder_can_be_disabled(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "owner_ids": ["owner-a"],
+                "owner_identity_prompt_enabled": False,
+            },
+        )
+        event = FakeEvent(group_id="group-a", sender_id="owner-a", text="小昭，测试")
+        event.set_extra(EXTRA_DECISION, "REPLY")
+        request = ProviderRequest(system_prompt="base prompt")
+
+        asyncio.run(plugin.decorate_llm_request(event, request))
+
+        self.assertNotIn("主人识别", request.system_prompt)
+
+    def test_owner_identity_reminder_works_without_natural_style(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "owner_ids": ["owner-a"],
+                "natural_chat_style_enabled": False,
+            },
+        )
+        event = FakeEvent(
+            group_id="private-a",
+            sender_id="owner-a",
+            text="测试",
+            message_type="FRIEND_MESSAGE",
+        )
+        request = ProviderRequest(system_prompt="base prompt")
+
+        asyncio.run(plugin.decorate_llm_request(event, request))
+
+        self.assertIn("主人识别: 当前发言人身份=已确认主人", request.system_prompt)
+        self.assertNotIn("按实时群聊的自然对话", request.system_prompt)
+
     def test_active_reply_style_emphasizes_lightweight_non_intrusive_reply(self) -> None:
         plugin = build_plugin({"mention_keywords": ["小昭"]})
         event = FakeEvent(group_id="group-a", sender_id="user-a", text="这个配置怎么改？")

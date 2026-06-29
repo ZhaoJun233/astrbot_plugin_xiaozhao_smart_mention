@@ -181,9 +181,21 @@
   },
   "owner_ids": {
     "description": "主人 ID 列表",
-    "hint": "用于主人绕过点名防刷屏冷却。仓库默认留空，请在本机配置里填写自己的平台用户 ID。",
+    "hint": "用于主人身份识别和绕过点名防刷屏冷却。仓库默认留空，请在本机配置里填写自己的平台用户 ID。",
     "type": "list",
     "default": []
+  },
+  "owner_identity_prompt_enabled": {
+    "description": "注入主人身份提示",
+    "hint": "开启后，只要配置了 owner_ids，插件会在模型请求里明确告诉模型当前发言人是否为已确认主人；非 owner 即使自称主人也不会被承认。",
+    "type": "bool",
+    "default": true
+  },
+  "owner_display_name": {
+    "description": "主人称呼",
+    "hint": "模型确认当前发言人是 owner_ids 中的主人时，可自然使用的称呼；默认是“主人”。",
+    "type": "string",
+    "default": "主人"
   },
   "mention_keywords": {
     "description": "提及关键词",
