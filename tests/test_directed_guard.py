@@ -337,11 +337,19 @@ class FakeProvider:
 
 
 class FakeContext:
-    def __init__(self, provider=None) -> None:
+    def __init__(self, provider=None, group_records=None) -> None:
         self.provider = provider
+        self.group_records = group_records
 
     def get_using_provider(self, unified_msg_origin):
         return self.provider
+
+    def get_registered_star(self, name):
+        if name != "astrbot" or self.group_records is None:
+            return None
+        group_chat_context = types.SimpleNamespace(raw_records=self.group_records)
+        star_cls = types.SimpleNamespace(group_chat_context=group_chat_context)
+        return types.SimpleNamespace(star_cls=star_cls)
 
 
 class FakeResult:
@@ -845,6 +853,76 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertIn("列表、步骤、总结、配置说明", request.system_prompt)
         self.assertIn("不要每句都抢答", request.system_prompt)
         self.assertIn("简短接话", request.system_prompt)
+
+    def test_smart_reply_includes_recent_group_context_for_segmented_input(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "input_context_wait_sec": 0,
+            },
+        )
+        event = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭")
+        event.set_extra(EXTRA_DECISION, "REPLY")
+        plugin.context = FakeContext(
+            group_records={
+                event.unified_msg_origin: [
+                    "Alice: 小昭",
+                    "Bob: 还有预算限制",
+                    "Alice: 帮我们选一个插件方案",
+                ],
+            },
+        )
+        request = ProviderRequest(system_prompt="base prompt")
+
+        asyncio.run(plugin.decorate_llm_request(event, request))
+
+        self.assertIn("最近群聊上下文", request.system_prompt)
+        self.assertIn("Bob: 还有预算限制", request.system_prompt)
+        self.assertIn("Alice: 帮我们选一个插件方案", request.system_prompt)
+        self.assertIn("不要只按最后一条短消息回答", request.system_prompt)
+
+    def test_input_context_cache_catches_messages_arriving_during_wait(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "input_context_wait_sec": 0.02,
+            },
+        )
+        first = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭")
+        second = FakeEvent(group_id="group-a", sender_id="user-b", text="再加一个限制：不要太贵")
+        first.set_extra(EXTRA_DECISION, "REPLY")
+        request = ProviderRequest(system_prompt="base prompt")
+
+        async def run_case() -> None:
+            await plugin.record_input_context(first)
+            decorate_task = asyncio.create_task(plugin.decorate_llm_request(first, request))
+            await asyncio.sleep(0.005)
+            await plugin.record_input_context(second)
+            await decorate_task
+
+        asyncio.run(run_case())
+
+        self.assertIn("sender: 小昭", request.system_prompt)
+        self.assertIn("sender: 再加一个限制：不要太贵", request.system_prompt)
+
+    def test_recent_group_context_injection_can_be_disabled(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "input_context_enabled": False,
+            },
+        )
+        event = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭")
+        event.set_extra(EXTRA_DECISION, "REPLY")
+        plugin.context = FakeContext(
+            group_records={event.unified_msg_origin: ["Alice: 不应注入"]},
+        )
+        request = ProviderRequest(system_prompt="base prompt")
+
+        asyncio.run(plugin.decorate_llm_request(event, request))
+
+        self.assertNotIn("最近群聊上下文", request.system_prompt)
+        self.assertNotIn("不应注入", request.system_prompt)
 
     def test_plain_private_llm_request_gets_natural_style_guardrails(self) -> None:
         plugin = build_plugin({"mention_keywords": ["小昭"]})

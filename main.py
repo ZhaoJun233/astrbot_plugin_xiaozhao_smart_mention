@@ -4,6 +4,7 @@ import asyncio
 import json
 import random
 import re
+from collections import defaultdict, deque
 from collections.abc import AsyncGenerator, Iterable
 from time import monotonic
 
@@ -665,6 +666,21 @@ class Main(Star):
         self.active_reply_cooldown_sec = float(
             self.config.get("active_reply_cooldown_sec", 30),
         )
+        self.input_context_enabled = bool(
+            self.config.get("input_context_enabled", True),
+        )
+        self.input_context_wait_sec = max(
+            0.0,
+            _as_float(self.config.get("input_context_wait_sec"), 1.2),
+        )
+        self.input_context_limit = max(
+            1,
+            _as_int(self.config.get("input_context_limit"), 8),
+        )
+        self.input_context_window_sec = max(
+            1.0,
+            _as_float(self.config.get("input_context_window_sec"), 8.0),
+        )
         self.natural_chat_style_enabled = bool(
             self.config.get("natural_chat_style_enabled", True),
         )
@@ -786,6 +802,9 @@ class Main(Star):
         self._last_directed_sender_at: dict[str, float] = {}
         self._last_followup_target_at: dict[str, float] = {}
         self._followup_auto_rounds: dict[str, int] = {}
+        self._recent_input_records: dict[str, deque[tuple[float, str]]] = defaultdict(
+            deque,
+        )
 
     async def initialize(self) -> None:
         logger.info(
@@ -826,6 +845,26 @@ class Main(Star):
             _clip(text),
         )
         _stop_event_silently(event)
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
+    async def record_input_context(self, event: AstrMessageEvent) -> None:
+        if not self.input_context_enabled:
+            return
+        if event.get_message_type() != MessageType.GROUP_MESSAGE:
+            return
+        if self._is_self_message(event):
+            return
+
+        text = event.get_message_str().strip()
+        if not text:
+            return
+
+        now = monotonic()
+        sender = event.get_sender_name() or event.get_sender_id() or "未知发言人"
+        line = f"{sender}: {_clip(text, 300)}"
+        records = self._recent_input_records[event.unified_msg_origin]
+        records.append((now, line))
+        self._trim_input_records(records, now)
 
     @filter.custom_filter(MentionAliasFilter, priority=20)
     async def smart_mention(self, event: AstrMessageEvent) -> None:
@@ -1042,6 +1081,10 @@ class Main(Star):
         if is_smart_reply or is_native_directed:
             self._remove_direct_send_tool(req)
 
+        input_context = await self._input_context_reminder(
+            event,
+            enabled=is_smart_reply or is_native_directed,
+        )
         sender_name = event.get_sender_name() or "未知昵称"
         sender_id = event.get_sender_id() or "未知ID"
         reason = event.get_extra(
@@ -1064,6 +1107,7 @@ class Main(Star):
                 f"判断原因: {reason}。"
                 f"当前发言人昵称/ID: {sender_name}/{sender_id}。"
                 f"{owner_identity}"
+                f"{input_context}"
                 "请自然回应当前场景；"
                 "不要解释触发机制，不要特意强调对方是不是主人。"
                 f"{self._natural_chat_style_reminder(mode)}"
@@ -1078,6 +1122,37 @@ class Main(Star):
 
         note = f"<system_reminder>{note_body}</system_reminder>"
         req.system_prompt = (req.system_prompt or "") + "\n" + note
+
+    async def _input_context_reminder(
+        self,
+        event: AstrMessageEvent,
+        *,
+        enabled: bool,
+    ) -> str:
+        if (
+            not enabled
+            or not self.input_context_enabled
+            or event.get_message_type() != MessageType.GROUP_MESSAGE
+        ):
+            return ""
+
+        if self.input_context_wait_sec > 0:
+            await asyncio.sleep(self.input_context_wait_sec)
+
+        recent_context = self._recent_group_context(event, self.input_context_limit)
+        if not recent_context:
+            return ""
+
+        current_text = event.get_message_str().strip()
+        current_line = f"当前触发消息: {current_text}\n" if current_text else ""
+        return (
+            "最近群聊上下文（可能包含同一人或多人连续分段发给机器人的内容）：\n"
+            f"{recent_context}\n"
+            f"{current_line}"
+            "请把明显连续的补充消息合起来理解；如果前后几条是在补充同一个请求，"
+            "按完整请求回答，不要只按最后一条短消息回答。"
+            "如果上下文已经转入无关话题，不要强行合并。"
+        )
 
     def _owner_identity_reminder(self, event: AstrMessageEvent) -> str:
         if not self.owner_identity_prompt_enabled or not self.owner_ids:
@@ -1890,6 +1965,10 @@ class Main(Star):
         return image_urls
 
     def _recent_group_context(self, event: AstrMessageEvent, limit: int = 8) -> str:
+        local_context = self._recent_input_context(event, limit)
+        if local_context:
+            return local_context
+
         try:
             metadata = self.context.get_registered_star("astrbot")
             star_cls = getattr(metadata, "star_cls", None) if metadata else None
@@ -1902,6 +1981,25 @@ class Main(Star):
         except Exception as exc:
             logger.debug("%s read group context failed: %s", PLUGIN_TAG, exc)
             return ""
+
+    def _recent_input_context(self, event: AstrMessageEvent, limit: int) -> str:
+        records = self._recent_input_records.get(event.unified_msg_origin)
+        if not records:
+            return ""
+        now = monotonic()
+        self._trim_input_records(records, now)
+        lines = [line for _, line in list(records)[-limit:]]
+        return "\n".join(lines)
+
+    def _trim_input_records(
+        self,
+        records: deque[tuple[float, str]],
+        now: float,
+    ) -> None:
+        while records and now - records[0][0] > self.input_context_window_sec:
+            records.popleft()
+        while len(records) > max(self.input_context_limit * 2, 20):
+            records.popleft()
 
     def _primary_mention_keyword(self) -> str:
         if self.mention_keywords:

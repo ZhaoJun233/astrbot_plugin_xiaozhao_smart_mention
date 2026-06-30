@@ -23,6 +23,30 @@
     "type": "int",
     "default": 30
   },
+  "input_context_enabled": {
+    "description": "聚合连续输入上下文",
+    "hint": "群里一个人或多个人分段对机器人说话时，回复前短暂等待并把最近几条群消息注入给模型，避免只按最后一条短消息回答。",
+    "type": "bool",
+    "default": true
+  },
+  "input_context_wait_sec": {
+    "description": "连续输入等待（秒）",
+    "hint": "点名或原生 @ 触发后，在生成回复前最多等待多久收集后续补充分段。调大更容易吃到多条分段，但回复会更慢；设为 0 可关闭等待但仍注入已有上下文。",
+    "type": "float",
+    "default": 1.2
+  },
+  "input_context_limit": {
+    "description": "输入上下文条数",
+    "hint": "每次注入给模型的最近群消息条数上限。",
+    "type": "int",
+    "default": 8
+  },
+  "input_context_window_sec": {
+    "description": "输入上下文窗口（秒）",
+    "hint": "插件本地短期缓存群消息的时间窗口，只用于聚合连续分段输入；过期消息不会注入。",
+    "type": "float",
+    "default": 8.0
+  },
   "natural_chat_style_enabled": {
     "description": "自然群聊风格约束",
     "hint": "插件触发或原生点名回复时追加自然群聊风格提醒：日常聊天可短段分段，列表、步骤、总结、配置说明时收束成紧凑回答。",
