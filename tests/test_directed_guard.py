@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 import types
 import unittest
 from time import monotonic
@@ -544,6 +545,18 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertEqual(decision, "SKIP")
         self.assertTrue(reason.startswith("judge_backoff:"))
 
+    def test_direct_summon_replies_without_llm_judge(self) -> None:
+        plugin = build_plugin({"mention_keywords": ["小昭"]})
+        provider = FakeProvider("SKIP")
+        plugin.context = FakeContext(provider)
+        event = FakeEvent(group_id="group-a", sender_id="user-a")
+
+        decision, reason = asyncio.run(plugin._decide(event, "小昭"))
+
+        self.assertEqual(decision, "REPLY")
+        self.assertEqual(reason, "direct_summon")
+        self.assertEqual(provider.calls, [])
+
     def test_keyword_replies_are_rate_limited_for_non_owners(self) -> None:
         plugin = build_plugin(
             {
@@ -904,6 +917,23 @@ class DirectedReplyGuardTest(unittest.TestCase):
 
         self.assertIn("sender: 小昭", request.system_prompt)
         self.assertIn("sender: 再加一个限制：不要太贵", request.system_prompt)
+
+    def test_full_question_does_not_wait_for_more_input_context(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "input_context_wait_sec": 0.2,
+            },
+        )
+        event = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭你觉得这个配置怎么改才好？")
+        event.set_extra(EXTRA_DECISION, "REPLY")
+        request = ProviderRequest(system_prompt="base prompt")
+
+        started = time.perf_counter()
+        asyncio.run(plugin.decorate_llm_request(event, request))
+        elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 0.08)
 
     def test_recent_group_context_injection_can_be_disabled(self) -> None:
         plugin = build_plugin(
@@ -1320,6 +1350,21 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertIn("清理质检", provider.calls[1]["system_prompt"])
         self.assertEqual(resp.completion_text, "收到测试信号喵～！\n\n小昭状态报告：系统正常。")
 
+    def test_model_rewrite_skips_extra_call_when_local_cleanup_does_not_change_text(self) -> None:
+        class Response:
+            completion_text = "小昭收到，测试通过喵～"
+
+        provider = FakeProvider("不应该调用模型")
+        plugin = build_plugin({"natural_rewrite_use_model": True})
+        plugin.context = FakeContext(provider)
+        event = FakeEvent(group_id="private-a", sender_id="user-a")
+        resp = Response()
+
+        asyncio.run(plugin.clean_llm_response_actions(event, resp))
+
+        self.assertEqual(resp.completion_text, "小昭收到，测试通过喵～")
+        self.assertEqual(provider.calls, [])
+
     def test_model_rewrite_that_drops_prefix_falls_back_to_local_text(self) -> None:
         class Response:
             completion_text = (
@@ -1335,7 +1380,7 @@ class DirectedReplyGuardTest(unittest.TestCase):
 
         asyncio.run(plugin.clean_llm_response_actions(event, resp))
 
-        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(provider.calls, [])
         self.assertTrue(resp.completion_text.startswith("要说坏蛋的话"))
         self.assertIn("反正小昭觉得他不太靠谱。", resp.completion_text)
 
@@ -1415,9 +1460,7 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertIn("收到测试信号喵～！", resp.completion_text)
 
     def test_decorating_result_sends_model_segments_as_separate_messages(self) -> None:
-        provider = FakeProvider(
-            '{"segments":["收到测试信号喵～！","小昭状态正常，可爱值也在线，刚刚那次调用没有掉线。","主人还想测什么，小昭继续陪着。"]}',
-        )
+        provider = FakeProvider('{"segments":["不应该调用模型"]}')
         plugin = build_plugin({"smart_segment_interval_sec": 0})
         plugin.context = FakeContext(provider)
         event = FakeEvent(group_id="private-a", sender_id="user-a")
@@ -1438,9 +1481,7 @@ class DirectedReplyGuardTest(unittest.TestCase):
             "小昭状态正常，可爱值也在线，刚刚那次调用没有掉线。",
             "主人还想测什么，小昭继续陪着。",
         ])
-        self.assertIn("JSON", provider.calls[0]["system_prompt"])
-        self.assertIn("数量由自然语气决定，不固定", provider.calls[0]["system_prompt"])
-        self.assertIn("不要固定段数", provider.calls[0]["prompt"])
+        self.assertEqual(provider.calls, [])
 
     def test_decorating_result_clears_original_when_segment_send_partially_fails(self) -> None:
         provider = FakeProvider(
@@ -1509,7 +1550,7 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertTrue(any("1. 别太客气" in text for text in sent_texts))
         self.assertEqual(provider.calls, [])
 
-    def test_slow_model_segment_quickly_falls_back_to_local_segments(self) -> None:
+    def test_model_segment_is_skipped_when_local_segments_are_enough(self) -> None:
         provider = FakeProvider('{"segments":["不应该调用"]}', delay=0.2)
         plugin = build_plugin(
             {
@@ -1534,7 +1575,7 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertLess(elapsed, 0.18)
         self.assertIsNone(event.result)
         self.assertGreaterEqual(len(event.sent_messages), 2)
-        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(provider.calls, [])
 
     def test_natural_chat_style_prefers_short_chat_segments(self) -> None:
         plugin = build_plugin({})

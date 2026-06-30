@@ -642,6 +642,23 @@ def _contains_keyword(text: str, mention_keywords: Iterable[str]) -> bool:
     return any(keyword and keyword in text for keyword in mention_keywords)
 
 
+def _strip_leading_mention_keyword(text: str, mention_keywords: Iterable[str]) -> str:
+    stripped = str(text or "").strip()
+    for keyword in sorted(_dedupe(mention_keywords), key=len, reverse=True):
+        if not keyword or not stripped.startswith(keyword):
+            continue
+        return stripped[len(keyword) :].lstrip(" ,，!！?？:：")
+    return stripped
+
+
+def _is_direct_summon_text(text: str, mention_keywords: Iterable[str]) -> bool:
+    remainder = _strip_leading_mention_keyword(text, mention_keywords)
+    if remainder == str(text or "").strip():
+        return False
+    compact = re.sub(r"[\s,，!！?？。.:：~～]+", "", remainder).lower()
+    return compact in {"", "测试", "test", "在", "在吗", "出来", "来一下"}
+
+
 class MentionAliasFilter(CustomFilter):
     def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
         if event.get_message_type() != MessageType.GROUP_MESSAGE:
@@ -1136,7 +1153,7 @@ class Main(Star):
         ):
             return ""
 
-        if self.input_context_wait_sec > 0:
+        if self.input_context_wait_sec > 0 and self._should_wait_for_input_context(event):
             await asyncio.sleep(self.input_context_wait_sec)
 
         recent_context = self._recent_group_context(event, self.input_context_limit)
@@ -1153,6 +1170,17 @@ class Main(Star):
             "按完整请求回答，不要只按最后一条短消息回答。"
             "如果上下文已经转入无关话题，不要强行合并。"
         )
+
+    def _should_wait_for_input_context(self, event: AstrMessageEvent) -> bool:
+        text = _strip_leading_mention_keyword(
+            event.get_message_str().strip(),
+            self.mention_keywords,
+        )
+        if not text:
+            return True
+        if len(text) <= 6 and not re.search(r"[?？]|吗|嘛|呢|么|什么|怎么|谁|哪|几|多少", text):
+            return True
+        return False
 
     def _owner_identity_reminder(self, event: AstrMessageEvent) -> str:
         if not self.owner_identity_prompt_enabled or not self.owner_ids:
@@ -1200,7 +1228,12 @@ class Main(Star):
 
         text = getattr(resp, "completion_text", "") or ""
         cleaned = _strip_final_reply_text(text)
-        if self.natural_chat_style_enabled and self.natural_rewrite_use_model:
+        cleanup_changed = cleaned != text
+        if (
+            cleanup_changed
+            and self.natural_chat_style_enabled
+            and self.natural_rewrite_use_model
+        ):
             cleaned = await self._rewrite_reply_naturally(event, cleaned)
             cleaned = _strip_final_reply_text(cleaned)
         elif self.natural_chat_style_enabled:
@@ -1447,7 +1480,9 @@ class Main(Star):
         text: str,
     ) -> list[str]:
         local_segments = _natural_local_segments(text, self.natural_chat_max_sentences)
-        if not self.smart_segment_use_model:
+        if len(local_segments) >= 2 or not self.smart_segment_use_model:
+            return local_segments
+        if len(_normalise_segment_text(text)) < 120:
             return local_segments
 
         prompt = (
@@ -1779,6 +1814,9 @@ class Main(Star):
         for pattern in self.reply_patterns:
             if pattern.search(text):
                 return "REPLY", f"reply_pattern:{pattern.pattern}"
+
+        if _is_direct_summon_text(text, self.mention_keywords):
+            return "REPLY", "direct_summon"
 
         if not self.use_llm_judge:
             return "SKIP", "llm_judge_disabled"
