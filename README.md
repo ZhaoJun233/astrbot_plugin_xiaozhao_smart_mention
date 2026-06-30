@@ -6,6 +6,7 @@
 
 - 群聊提到配置的 `mention_keywords` 时，先判断当前消息是不是在叫机器人、问机器人、请求机器人帮忙。
 - 对只是旁观讨论、复述、玩笑、明确说不用回复的消息，尽量不打扰。
+- 关键词、原生 `@机器人`、回复机器人和私聊触发回复前会先经过连续输入安静窗口；如果窗口内继续补充，前一条会静默取消，由最后一条带上下文统一触发回复。
 - 支持普通群聊消息的智能主动回复：只有模型判断小昭此刻自然插话有帮助时才回复。
 - 支持短时间续聊：小昭刚回复某人后，同一人不再点名但继续追问时也能自然接上。
 - 自动读取 AstrBot 当前群聊上下文，辅助判断当前对话场景。
@@ -76,6 +77,13 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 | `judge_timeout_sec` | int | `8` | 智能判定模型调用超时时间，单位秒。 |
 | `active_reply_enabled` | bool | `true` | 是否启用未被点名时的智能主动回复。 |
 | `active_reply_cooldown_sec` | int | `30` | 同一会话内主动回复冷却时间，避免连续抢话。 |
+| `input_context_enabled` | bool | `true` | 是否记录短期输入上下文，用于把连续分段消息合起来理解。 |
+| `input_context_wait_sec` | float | `1.2` | LLM 请求前额外等待收集上下文的时间；设为 `0` 可关闭这层等待但仍使用已记录上下文。 |
+| `input_context_debounce_enabled` | bool | `true` | 是否启用回复前安静窗口，防止关键词、点名、私聊等场景抢答分段输入。 |
+| `input_context_debounce_sec` | float | `0.8` | 群聊关键词/点名回复前的安静窗口；窗口内继续发言时取消前一条，由最后一条带上下文回复。 |
+| `private_input_debounce_sec` | float | `2.5` | 私聊回复前的独立安静窗口，适合先叫机器人、再补充内容的聊天习惯。 |
+| `input_context_limit` | int | `8` | 最多注入多少条最近输入上下文。 |
+| `input_context_window_sec` | float | `8.0` | 本地短期输入缓存窗口，过期消息不会参与分段合并。 |
 | `natural_chat_style_enabled` | bool | `true` | 是否在插件触发或原生点名回复中追加自然群聊风格约束。日常聊天由模型按语气自行判断是否短段分段，列表、步骤、总结、配置说明时收束成紧凑回答。 |
 | `smart_segment_enabled` | bool | `true` | AstrBot 全局分段关闭时，是否由插件接管日常聊天回复的自然分段发送。 |
 | `smart_segment_use_model` | bool | `true` | 是否调用当前会话模型分析自然分段；失败、超时或返回不合规时退回本地分段。 |
@@ -138,7 +146,8 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 1. 明确“不用回复”“别理”等跳过表达，选择不回复。
 2. 明确叫机器人、问机器人、请求机器人帮忙，选择回复。
 3. 规则不确定时，如果 `use_llm_judge=true`，调用当前会话模型只输出 `REPLY` 或 `SKIP`。
-4. 判定为 `REPLY` 时，把本轮消息标记为唤醒消息，交给 AstrBot 正常 LLM 流程生成回复。
+4. 判定为 `REPLY` 时，如果 `input_context_debounce_enabled=true`，先等待 `input_context_debounce_sec` 安静窗口。窗口内有人继续补充时，当前消息静默取消；后续最后一条消息会带最近上下文统一触发回复。
+5. 安静窗口内没有后续补充时，把本轮消息标记为唤醒消息，交给 AstrBot 正常 LLM 流程生成回复。
 
 如果 `natural_chat_style_enabled=true`，插件会在本轮 LLM 请求里追加一段稳定的系统提醒：按实时群聊自然对话回复，日常聊天由模型按语气、停顿和信息密度自行判断是否拆成短段；`natural_chat_max_sentences` 只作为安全上限，避免刷屏。列表、步骤、总结、配置说明时收束成一段紧凑的结构化回答，并且不要每句都抢答。`action_output_enabled=false` 时，插件还会在 LLM 回复后用本地规则兜底清理常见括号动作描写、日常聊天标题和基础短段格式，并在确实发生动作清理后调用当前会话模型做一次质检，防止残留动作或误删内容；原生 @/引用机器人触发的群聊回复也会受这个开关影响。默认不会为了自然化整理再额外调用一次模型；只有 `natural_rewrite_use_model=true` 时才会启用模型自然改写。
 

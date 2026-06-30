@@ -960,6 +960,33 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertTrue(first._force_stopped)
         self.assertFalse(first.is_at_or_wake_command)
 
+    def test_full_keyword_question_defers_when_sender_continues(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "input_context_debounce_sec": 0.02,
+                "input_context_wait_sec": 0.02,
+                "active_reply_cooldown_sec": 0,
+            },
+        )
+        plugin._get_or_create_conversation = _return_conversation
+        first = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭你是来搞笑的吗")
+        second = FakeEvent(group_id="group-a", sender_id="user-a", text="不行了")
+
+        async def run_case() -> None:
+            await plugin.record_input_context(first)
+            first_task = asyncio.create_task(plugin.smart_mention(first))
+            await asyncio.sleep(0.005)
+            await plugin.record_input_context(second)
+            await first_task
+
+        asyncio.run(run_case())
+
+        self.assertEqual(first.get_extra(EXTRA_DECISION), "SKIP")
+        self.assertEqual(first.get_extra(EXTRA_REASON), "input_context_waiting_for_more")
+        self.assertTrue(first._force_stopped)
+        self.assertFalse(first.is_at_or_wake_command)
+
     def test_pending_segmented_input_replies_on_latest_message(self) -> None:
         plugin = build_plugin(
             {

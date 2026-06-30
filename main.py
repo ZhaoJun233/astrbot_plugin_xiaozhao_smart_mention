@@ -927,7 +927,11 @@ class Main(Star):
         decision, reason = await self._decide(event, text)
 
         if decision == "REPLY":
-            if await self._defer_reply_if_input_continues(event, same_sender_only=False):
+            if await self._defer_reply_if_input_continues(
+                event,
+                require_short=False,
+                same_sender_only=False,
+            ):
                 return
 
             allowed, guard_reason = self._consume_keyword_reply_slot(event)
