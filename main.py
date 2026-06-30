@@ -27,6 +27,8 @@ PLUGIN_TAG = "[xiaozhao_smart_mention]"
 EXTRA_DECISION = "xiaozhao_smart_mention_decision"
 EXTRA_REASON = "xiaozhao_smart_mention_reason"
 EXTRA_MODE = "xiaozhao_smart_mention_mode"
+EXTRA_INPUT_SEQUENCE = "xiaozhao_smart_mention_input_sequence"
+EXTRA_INPUT_QUIET_CHECKED = "xiaozhao_smart_mention_input_quiet_checked"
 ACTION_OUTPUT_KEYWORDS = (
     "动作",
     "舞台",
@@ -690,6 +692,23 @@ class Main(Star):
             0.0,
             _as_float(self.config.get("input_context_wait_sec"), 1.2),
         )
+        self.input_context_debounce_enabled = bool(
+            self.config.get("input_context_debounce_enabled", True),
+        )
+        self.input_context_debounce_sec = max(
+            0.0,
+            _as_float(
+                self.config.get("input_context_debounce_sec"),
+                self.input_context_wait_sec,
+            ),
+        )
+        self.private_input_debounce_sec = max(
+            0.0,
+            _as_float(
+                self.config.get("private_input_debounce_sec"),
+                max(self.input_context_debounce_sec, 2.5),
+            ),
+        )
         self.input_context_limit = max(
             1,
             _as_int(self.config.get("input_context_limit"), 8),
@@ -819,9 +838,11 @@ class Main(Star):
         self._last_directed_sender_at: dict[str, float] = {}
         self._last_followup_target_at: dict[str, float] = {}
         self._followup_auto_rounds: dict[str, int] = {}
-        self._recent_input_records: dict[str, deque[tuple[float, str]]] = defaultdict(
-            deque,
+        self._recent_input_records: dict[str, deque[tuple[float, int, str, str]]] = (
+            defaultdict(deque)
         )
+        self._input_sequence_by_origin: dict[str, int] = defaultdict(int)
+        self._pending_input_reply_until: dict[str, float] = {}
 
     async def initialize(self) -> None:
         logger.info(
@@ -839,13 +860,25 @@ class Main(Star):
             return
         if self._is_self_message(event):
             return
-        if self.directed_reply_owner_bypass and self._is_owner_message(event):
-            return
         if not self._has_native_directed_signal(event):
+            return
+
+        owner_bypass = self.directed_reply_owner_bypass and self._is_owner_message(event)
+        if await self._defer_reply_if_input_continues(
+            event,
+            require_short=False,
+            same_sender_only=False,
+        ):
+            return
+
+        if owner_bypass:
+            self._clear_pending_input_reply(event)
+            self._record_followup_target(event)
             return
 
         allowed, reason = self._consume_directed_reply_slot(event)
         if allowed:
+            self._clear_pending_input_reply(event)
             self._record_followup_target(event)
             return
 
@@ -863,11 +896,14 @@ class Main(Star):
         )
         _stop_event_silently(event)
 
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
+    @filter.event_message_type(
+        filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.PRIVATE_MESSAGE,
+        priority=1000,
+    )
     async def record_input_context(self, event: AstrMessageEvent) -> None:
         if not self.input_context_enabled:
             return
-        if event.get_message_type() != MessageType.GROUP_MESSAGE:
+        if not self._supports_input_context(event):
             return
         if self._is_self_message(event):
             return
@@ -876,12 +912,7 @@ class Main(Star):
         if not text:
             return
 
-        now = monotonic()
-        sender = event.get_sender_name() or event.get_sender_id() or "未知发言人"
-        line = f"{sender}: {_clip(text, 300)}"
-        records = self._recent_input_records[event.unified_msg_origin]
-        records.append((now, line))
-        self._trim_input_records(records, now)
+        self._record_input_event(event)
 
     @filter.custom_filter(MentionAliasFilter, priority=20)
     async def smart_mention(self, event: AstrMessageEvent) -> None:
@@ -896,6 +927,9 @@ class Main(Star):
         decision, reason = await self._decide(event, text)
 
         if decision == "REPLY":
+            if await self._defer_reply_if_input_continues(event, same_sender_only=False):
+                return
+
             allowed, guard_reason = self._consume_keyword_reply_slot(event)
             if not allowed:
                 event.set_extra(EXTRA_DECISION, "SKIP")
@@ -939,6 +973,46 @@ class Main(Star):
             _clip(text),
         )
 
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=-20)
+    async def smart_private_reply(
+        self,
+        event: AstrMessageEvent,
+    ) -> AsyncGenerator[ProviderRequest | None, None]:
+        if event.get_extra(EXTRA_DECISION):
+            return
+        if self._is_self_message(event):
+            return
+
+        text = event.get_message_str().strip()
+        if not text:
+            return
+
+        if await self._defer_reply_if_input_continues(event, require_short=False):
+            return
+
+        conversation = await self._get_or_create_conversation(event)
+        if conversation is None:
+            return
+
+        self._clear_pending_input_reply(event)
+        event.set_extra(EXTRA_DECISION, "REPLY")
+        event.set_extra(EXTRA_REASON, "private_input_debounce")
+        event.set_extra(EXTRA_MODE, "private_reply")
+        self._record_followup_target(event)
+        logger.info(
+            "%s private reply: sender=%s reason=private_input_debounce text=%s",
+            PLUGIN_TAG,
+            event.get_sender_id(),
+            _clip(text),
+        )
+        yield event.request_llm(
+            prompt=text,
+            session_id=event.session_id,
+            image_urls=await self._collect_image_urls(event),
+            conversation=conversation,
+        )
+        _stop_event_silently(event)
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=-20)
     async def smart_active_reply(
         self,
@@ -963,6 +1037,30 @@ class Main(Star):
             return
         if _contains_keyword(text, self.mention_keywords):
             return
+        pending_allowed, pending_reason = self._pending_input_reply_reason(event)
+        if pending_allowed:
+            if await self._defer_reply_if_input_continues(
+                event,
+                require_short=False,
+                same_sender_only=False,
+            ):
+                return
+            self._clear_pending_input_reply(event)
+            cooling_down, cooldown_reason = self._is_active_reply_cooldown_active(event)
+            if cooling_down:
+                logger.debug("%s active skip: %s", PLUGIN_TAG, cooldown_reason)
+                return
+            request = await self._build_active_reply_request(
+                event,
+                text,
+                pending_reason,
+                followup_auto=True,
+            )
+            if request is None:
+                return
+            yield request
+            _stop_event_silently(event)
+            return
         if self._is_followup_auto_round_limited(event):
             logger.debug("%s active skip: followup_auto_round_limit", PLUGIN_TAG)
             return
@@ -985,6 +1083,8 @@ class Main(Star):
                 followup_allowed = True
                 followup_reason = f"followup_score:{score}/{self.followup_score_threshold}:{','.join(score_reasons)}"
         if followup_allowed:
+            if await self._defer_reply_if_input_continues(event):
+                return
             cooling_down, cooldown_reason = self._is_active_reply_cooldown_active(event)
             if cooling_down:
                 logger.debug("%s active skip: %s", PLUGIN_TAG, cooldown_reason)
@@ -1002,6 +1102,9 @@ class Main(Star):
             return
         if not self._has_active_reply_cue(text):
             logger.debug("%s active skip: no_active_reply_cue", PLUGIN_TAG)
+            return
+
+        if await self._defer_reply_if_input_continues(event):
             return
 
         cooling_down, cooldown_reason = self._is_active_reply_cooldown_active(event)
@@ -1086,10 +1189,12 @@ class Main(Star):
     ) -> None:
         is_smart_reply = event.get_extra(EXTRA_DECISION) == "REPLY"
         is_native_directed = self._has_native_directed_signal(event)
+        is_plugin_private = event.get_extra(EXTRA_MODE) == "private_reply"
         owner_identity = self._owner_identity_reminder(event)
         if (
             not is_smart_reply
             and not is_native_directed
+            and not is_plugin_private
             and not self.natural_chat_style_enabled
             and not owner_identity
         ):
@@ -1100,7 +1205,7 @@ class Main(Star):
 
         input_context = await self._input_context_reminder(
             event,
-            enabled=is_smart_reply or is_native_directed,
+            enabled=is_smart_reply or is_native_directed or is_plugin_private,
         )
         sender_name = event.get_sender_name() or "未知昵称"
         sender_id = event.get_sender_id() or "未知ID"
@@ -1133,6 +1238,7 @@ class Main(Star):
             note_body = (
                 f"当前发言人昵称/ID: {sender_name}/{sender_id}。"
                 f"{owner_identity}"
+                f"{input_context}"
                 "请自然回应当前场景；不要主动说明内部规则。"
                 f"{self._natural_chat_style_reminder('plain_llm')}"
             )
@@ -1149,12 +1255,13 @@ class Main(Star):
         if (
             not enabled
             or not self.input_context_enabled
-            or event.get_message_type() != MessageType.GROUP_MESSAGE
+            or not self._supports_input_context(event)
         ):
             return ""
 
         if self.input_context_wait_sec > 0 and self._should_wait_for_input_context(event):
-            await asyncio.sleep(self.input_context_wait_sec)
+            if not event.get_extra(EXTRA_INPUT_QUIET_CHECKED):
+                await asyncio.sleep(self.input_context_wait_sec)
 
         recent_context = self._recent_group_context(event, self.input_context_limit)
         if not recent_context:
@@ -1181,6 +1288,175 @@ class Main(Star):
         if len(text) <= 6 and not re.search(r"[?？]|吗|嘛|呢|么|什么|怎么|谁|哪|几|多少", text):
             return True
         return False
+
+    async def _defer_reply_if_input_continues(
+        self,
+        event: AstrMessageEvent,
+        *,
+        require_short: bool = True,
+        same_sender_only: bool = True,
+    ) -> bool:
+        debounce_sec = self._input_debounce_sec(event)
+        if (
+            not self.input_context_enabled
+            or not self.input_context_debounce_enabled
+            or debounce_sec <= 0
+            or not self._supports_input_context(event)
+        ):
+            return False
+        if require_short and not self._should_wait_for_input_context(event):
+            return False
+
+        start_sequence = self._ensure_input_sequence(event)
+        group_scope = (
+            not same_sender_only
+            and event.get_message_type() == MessageType.GROUP_MESSAGE
+        )
+        self._mark_pending_input_reply(
+            event,
+            group_scope=group_scope,
+            debounce_sec=debounce_sec,
+        )
+        await asyncio.sleep(debounce_sec)
+        event.set_extra(EXTRA_INPUT_QUIET_CHECKED, True)
+
+        if not self._has_later_input(
+            event,
+            start_sequence,
+            same_sender_only=same_sender_only,
+        ):
+            self._clear_pending_input_reply(event, group_scope=group_scope)
+            return False
+
+        event.set_extra(EXTRA_DECISION, "SKIP")
+        event.set_extra(EXTRA_REASON, "input_context_waiting_for_more")
+        event.set_extra(EXTRA_MODE, "input_context_debounce")
+        logger.info(
+            "%s defer reply: group=%s sender=%s reason=input_context_waiting_for_more text=%s",
+            PLUGIN_TAG,
+            event.get_group_id(),
+            event.get_sender_id(),
+            _clip(event.get_message_str().strip()),
+        )
+        _stop_event_silently(event)
+        return True
+
+    def _supports_input_context(self, event: AstrMessageEvent) -> bool:
+        return event.get_message_type() in {
+            MessageType.GROUP_MESSAGE,
+            MessageType.FRIEND_MESSAGE,
+        }
+
+    def _input_debounce_sec(self, event: AstrMessageEvent) -> float:
+        if event.get_message_type() == MessageType.FRIEND_MESSAGE:
+            return self.private_input_debounce_sec
+        return self.input_context_debounce_sec
+
+    def _record_input_event(self, event: AstrMessageEvent) -> int:
+        sequence = event.get_extra(EXTRA_INPUT_SEQUENCE)
+        if isinstance(sequence, int):
+            return sequence
+
+        now = monotonic()
+        origin = event.unified_msg_origin
+        self._input_sequence_by_origin[origin] += 1
+        sequence = self._input_sequence_by_origin[origin]
+        event.set_extra(EXTRA_INPUT_SEQUENCE, sequence)
+
+        sender = event.get_sender_name() or event.get_sender_id() or "未知发言人"
+        sender_id = str(event.get_sender_id() or "")
+        line = f"{sender}: {_clip(event.get_message_str().strip(), 300)}"
+        records = self._recent_input_records[origin]
+        records.append((now, sequence, sender_id, line))
+        self._trim_input_records(records, now)
+        return sequence
+
+    def _ensure_input_sequence(self, event: AstrMessageEvent) -> int:
+        sequence = event.get_extra(EXTRA_INPUT_SEQUENCE)
+        if isinstance(sequence, int):
+            return sequence
+        return self._record_input_event(event)
+
+    def _has_later_input(
+        self,
+        event: AstrMessageEvent,
+        start_sequence: int,
+        *,
+        same_sender_only: bool,
+    ) -> bool:
+        records = self._recent_input_records.get(event.unified_msg_origin)
+        if not records:
+            return False
+        now = monotonic()
+        self._trim_input_records(records, now)
+        if not same_sender_only:
+            return any(sequence > start_sequence for _, sequence, _, _ in records)
+
+        sender_id = str(event.get_sender_id() or "")
+        return any(
+            sequence > start_sequence and record_sender_id == sender_id
+            for _, sequence, record_sender_id, _ in records
+        )
+
+    def _input_debounce_key(self, event: AstrMessageEvent) -> str:
+        identity = event_identity(event)
+        return f"{identity.bot_key}:group:{identity.group_id}:sender:{identity.sender_id}"
+
+    def _input_debounce_group_key(self, event: AstrMessageEvent) -> str:
+        identity = event_identity(event)
+        return f"{identity.bot_key}:group:{identity.group_id}:sender:*"
+
+    def _mark_pending_input_reply(
+        self,
+        event: AstrMessageEvent,
+        *,
+        group_scope: bool = False,
+        debounce_sec: float | None = None,
+    ) -> None:
+        ttl = max(
+            self.input_context_window_sec,
+            debounce_sec if debounce_sec is not None else self._input_debounce_sec(event),
+            1.0,
+        )
+        key = (
+            self._input_debounce_group_key(event)
+            if group_scope and event.get_message_type() == MessageType.GROUP_MESSAGE
+            else self._input_debounce_key(event)
+        )
+        self._pending_input_reply_until[key] = monotonic() + ttl
+
+    def _pending_input_reply_reason(
+        self,
+        event: AstrMessageEvent,
+    ) -> tuple[bool, str]:
+        keys = [self._input_debounce_key(event)]
+        if event.get_message_type() == MessageType.GROUP_MESSAGE:
+            keys.append(self._input_debounce_group_key(event))
+        now = monotonic()
+        expired = False
+        for key in keys:
+            until = self._pending_input_reply_until.get(key)
+            if until is None:
+                continue
+            if now > until:
+                self._pending_input_reply_until.pop(key, None)
+                expired = True
+                continue
+            return True, "input_context_debounce"
+        if expired:
+            return False, "pending_input_reply_expired"
+        return False, "no_pending_input_reply"
+
+    def _clear_pending_input_reply(
+        self,
+        event: AstrMessageEvent,
+        *,
+        group_scope: bool | None = None,
+    ) -> None:
+        if group_scope is None or group_scope is False:
+            self._pending_input_reply_until.pop(self._input_debounce_key(event), None)
+        if group_scope is None or group_scope is True:
+            self._pending_input_reply_until.pop(self._input_debounce_group_key(event), None)
 
     def _owner_identity_reminder(self, event: AstrMessageEvent) -> str:
         if not self.owner_identity_prompt_enabled or not self.owner_ids:
@@ -2026,12 +2302,12 @@ class Main(Star):
             return ""
         now = monotonic()
         self._trim_input_records(records, now)
-        lines = [line for _, line in list(records)[-limit:]]
+        lines = [line for _, _, _, line in list(records)[-limit:]]
         return "\n".join(lines)
 
     def _trim_input_records(
         self,
-        records: deque[tuple[float, str]],
+        records: deque[tuple[float, int, str, str]],
         now: float,
     ) -> None:
         while records and now - records[0][0] > self.input_context_window_sec:

@@ -35,6 +35,24 @@
     "type": "float",
     "default": 1.2
   },
+  "input_context_debounce_enabled": {
+    "description": "连续输入防抢答",
+    "hint": "开启后，短点名或短补充消息会先等待一个安静窗口；如果同一人在窗口内继续发言，则静默取消前一条，让最后一条带上下文统一触发回复。",
+    "type": "bool",
+    "default": true
+  },
+  "input_context_debounce_sec": {
+    "description": "防抢答安静窗口（秒）",
+    "hint": "用于判断群聊里是否还会继续补充。窗口内继续发言时，前一条会被静默取消，由最后一条带上下文统一触发回复；设得越大越不容易抢答，但回复越慢。",
+    "type": "float",
+    "default": 0.8
+  },
+  "private_input_debounce_sec": {
+    "description": "私聊防抢答安静窗口（秒）",
+    "hint": "私聊默认所有文字消息都先等待该静默窗口；适合先叫机器人、再补充内容的聊天习惯。设得越大越不容易抢答，但首条回复越慢。",
+    "type": "float",
+    "default": 2.5
+  },
   "input_context_limit": {
     "description": "输入上下文条数",
     "hint": "每次注入给模型的最近群消息条数上限。",

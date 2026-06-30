@@ -30,8 +30,21 @@ def _install_astrbot_test_stubs() -> None:
         pass
 
     class _Filter:
+        class _EventMessageFlag:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def __or__(self, other):
+                return _Filter._EventMessageFlag(f"{self.name}|{getattr(other, 'name', other)}")
+
         class EventMessageType:
-            GROUP_MESSAGE = "GROUP_MESSAGE"
+            GROUP_MESSAGE = None
+            PRIVATE_MESSAGE = None
+            ALL = None
+
+        EventMessageType.GROUP_MESSAGE = _EventMessageFlag("GROUP_MESSAGE")
+        EventMessageType.PRIVATE_MESSAGE = _EventMessageFlag("PRIVATE_MESSAGE")
+        EventMessageType.ALL = _EventMessageFlag("ALL")
 
         @staticmethod
         def event_message_type(*args, **kwargs):
@@ -197,6 +210,7 @@ except ModuleNotFoundError:
 
 from main import (
     EXTRA_DECISION,
+    EXTRA_INPUT_QUIET_CHECKED,
     EXTRA_REASON,
     Main,
     _format_exception,
@@ -225,7 +239,8 @@ class FakeEvent:
         platform_id: str = "qq_personal_onebot",
         messages: list | None = None,
     ) -> None:
-        self.unified_msg_origin = f"{platform_id}:GroupMessage:{group_id}"
+        origin_kind = "FriendMessage" if message_type == "FRIEND_MESSAGE" else "GroupMessage"
+        self.unified_msg_origin = f"{platform_id}:{origin_kind}:{group_id}"
         self._group_id = group_id
         self._sender_id = sender_id
         self._self_id = self_id
@@ -899,13 +914,13 @@ class DirectedReplyGuardTest(unittest.TestCase):
             {
                 "mention_keywords": ["小昭"],
                 "input_context_wait_sec": 0.02,
+                "input_context_debounce_enabled": False,
             },
         )
         first = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭")
         second = FakeEvent(group_id="group-a", sender_id="user-b", text="再加一个限制：不要太贵")
-        first.set_extra(EXTRA_DECISION, "REPLY")
         request = ProviderRequest(system_prompt="base prompt")
-
+        first.set_extra(EXTRA_DECISION, "REPLY")
         async def run_case() -> None:
             await plugin.record_input_context(first)
             decorate_task = asyncio.create_task(plugin.decorate_llm_request(first, request))
@@ -917,6 +932,327 @@ class DirectedReplyGuardTest(unittest.TestCase):
 
         self.assertIn("sender: 小昭", request.system_prompt)
         self.assertIn("sender: 再加一个限制：不要太贵", request.system_prompt)
+
+    def test_short_summon_defers_when_same_sender_continues(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "input_context_debounce_sec": 0.02,
+                "input_context_wait_sec": 0.02,
+                "active_reply_cooldown_sec": 0,
+            },
+        )
+        plugin._get_or_create_conversation = _return_conversation
+        first = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭")
+        second = FakeEvent(group_id="group-a", sender_id="user-a", text="帮我看下这个附魔")
+
+        async def run_case() -> None:
+            await plugin.record_input_context(first)
+            first_task = asyncio.create_task(plugin.smart_mention(first))
+            await asyncio.sleep(0.005)
+            await plugin.record_input_context(second)
+            await first_task
+
+        asyncio.run(run_case())
+
+        self.assertEqual(first.get_extra(EXTRA_DECISION), "SKIP")
+        self.assertEqual(first.get_extra(EXTRA_REASON), "input_context_waiting_for_more")
+        self.assertTrue(first._force_stopped)
+        self.assertFalse(first.is_at_or_wake_command)
+
+    def test_pending_segmented_input_replies_on_latest_message(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "input_context_debounce_sec": 0.02,
+                "input_context_wait_sec": 0.02,
+                "active_reply_cooldown_sec": 0,
+            },
+        )
+        plugin._get_or_create_conversation = _return_conversation
+        first = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭")
+        second = FakeEvent(group_id="group-a", sender_id="user-a", text="帮我看下这个附魔")
+
+        async def run_case():
+            await plugin.record_input_context(first)
+            first_task = asyncio.create_task(plugin.smart_mention(first))
+            await asyncio.sleep(0.005)
+            await plugin.record_input_context(second)
+            await first_task
+            return [item async for item in plugin.smart_active_reply(second)]
+
+        items = asyncio.run(run_case())
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(second.get_extra(EXTRA_DECISION), "REPLY")
+        self.assertEqual(second.get_extra(EXTRA_REASON), "input_context_debounce")
+        self.assertEqual(items[0].prompt, "帮我看下这个附魔")
+
+    def test_pending_group_input_replies_while_first_message_is_still_waiting(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "input_context_debounce_sec": 0.05,
+                "input_context_wait_sec": 0.05,
+                "active_reply_cooldown_sec": 0,
+            },
+        )
+        plugin._get_or_create_conversation = _return_conversation
+        first = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭")
+        second = FakeEvent(group_id="group-a", sender_id="user-a", text="帮我看下这个附魔")
+
+        async def run_case():
+            await plugin.record_input_context(first)
+            first_task = asyncio.create_task(plugin.smart_mention(first))
+            await asyncio.sleep(0.005)
+            await plugin.record_input_context(second)
+            items = await _collect_async(plugin.smart_active_reply(second))
+            await first_task
+            return items
+
+        items = asyncio.run(run_case())
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(second.get_extra(EXTRA_DECISION), "REPLY")
+        self.assertEqual(second.get_extra(EXTRA_REASON), "input_context_debounce")
+        self.assertEqual(items[0].prompt, "帮我看下这个附魔")
+        self.assertEqual(first.get_extra(EXTRA_DECISION), "SKIP")
+
+    def test_pending_group_input_can_continue_from_another_sender(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "input_context_debounce_sec": 0.02,
+                "input_context_wait_sec": 0.02,
+                "active_reply_cooldown_sec": 0,
+            },
+        )
+        plugin._get_or_create_conversation = _return_conversation
+        first = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭")
+        second = FakeEvent(group_id="group-a", sender_id="user-b", text="还要考虑预算")
+
+        async def run_case():
+            await plugin.record_input_context(first)
+            first_task = asyncio.create_task(plugin.smart_mention(first))
+            await asyncio.sleep(0.005)
+            await plugin.record_input_context(second)
+            await first_task
+            return [item async for item in plugin.smart_active_reply(second)]
+
+        items = asyncio.run(run_case())
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(second.get_extra(EXTRA_DECISION), "REPLY")
+        self.assertEqual(second.get_extra(EXTRA_REASON), "input_context_debounce")
+        self.assertEqual(items[0].prompt, "还要考虑预算")
+
+    def test_pending_segmented_input_context_includes_prior_messages(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "input_context_debounce_sec": 0.02,
+                "input_context_wait_sec": 0.02,
+            },
+        )
+        first = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭")
+        second = FakeEvent(group_id="group-a", sender_id="user-a", text="帮我看下这个附魔")
+        request = ProviderRequest(system_prompt="base prompt")
+
+        async def run_case() -> None:
+            await plugin.record_input_context(first)
+            first_task = asyncio.create_task(plugin.smart_mention(first))
+            await asyncio.sleep(0.005)
+            await plugin.record_input_context(second)
+            await first_task
+            second.set_extra(EXTRA_DECISION, "REPLY")
+            second.set_extra(EXTRA_REASON, "input_context_debounce")
+            second.set_extra(EXTRA_INPUT_QUIET_CHECKED, True)
+            await plugin.decorate_llm_request(second, request)
+
+        asyncio.run(run_case())
+
+        self.assertIn("sender: 小昭", request.system_prompt)
+        self.assertIn("sender: 帮我看下这个附魔", request.system_prompt)
+
+    def test_native_directed_group_defers_before_default_reply(self) -> None:
+        from astrbot.api.message_components import At
+
+        plugin = build_plugin(
+            {
+                "input_context_debounce_sec": 0.02,
+                "input_context_wait_sec": 0.02,
+            },
+        )
+        first = FakeEvent(
+            group_id="group-a",
+            sender_id="user-a",
+            text="bot please wait for the next part",
+            messages=[At(qq="bot-a")],
+        )
+        second = FakeEvent(
+            group_id="group-a",
+            sender_id="user-a",
+            text="this is the actual second part",
+        )
+
+        async def run_case() -> None:
+            await plugin.record_input_context(first)
+            first_task = asyncio.create_task(plugin.directed_reply_guard(first))
+            await asyncio.sleep(0.005)
+            await plugin.record_input_context(second)
+            await first_task
+
+        asyncio.run(run_case())
+
+        self.assertEqual(first.get_extra(EXTRA_DECISION), "SKIP")
+        self.assertEqual(first.get_extra(EXTRA_REASON), "input_context_waiting_for_more")
+        self.assertTrue(first._force_stopped)
+        self.assertEqual(plugin._last_directed_group_at, {})
+
+    def test_native_directed_group_defers_when_other_sender_continues(self) -> None:
+        from astrbot.api.message_components import At
+
+        plugin = build_plugin(
+            {
+                "input_context_debounce_sec": 0.02,
+                "input_context_wait_sec": 0.02,
+            },
+        )
+        first = FakeEvent(
+            group_id="group-a",
+            sender_id="user-a",
+            text="bot please wait for the next part",
+            messages=[At(qq="bot-a")],
+        )
+        second = FakeEvent(
+            group_id="group-a",
+            sender_id="user-b",
+            text="another user adds the actual second part",
+        )
+
+        async def run_case() -> None:
+            await plugin.record_input_context(first)
+            first_task = asyncio.create_task(plugin.directed_reply_guard(first))
+            await asyncio.sleep(0.005)
+            await plugin.record_input_context(second)
+            await first_task
+
+        asyncio.run(run_case())
+
+        self.assertEqual(first.get_extra(EXTRA_DECISION), "SKIP")
+        self.assertEqual(first.get_extra(EXTRA_REASON), "input_context_waiting_for_more")
+        self.assertTrue(first._force_stopped)
+        self.assertEqual(plugin._last_directed_group_at, {})
+
+    def test_private_event_reply_defers_when_sender_continues(self) -> None:
+        plugin = build_plugin(
+            {
+                "input_context_debounce_sec": 0.02,
+                "input_context_wait_sec": 0.02,
+            },
+        )
+        first = FakeEvent(
+            group_id="private-a",
+            sender_id="user-a",
+            text="please wait for the next part",
+            message_type="FRIEND_MESSAGE",
+        )
+        second = FakeEvent(
+            group_id="private-a",
+            sender_id="user-a",
+            text="this is the actual second part",
+            message_type="FRIEND_MESSAGE",
+        )
+
+        async def run_case():
+            await plugin.record_input_context(first)
+            first_task = asyncio.create_task(_collect_async(plugin.smart_private_reply(first)))
+            await asyncio.sleep(0.005)
+            await plugin.record_input_context(second)
+            return await first_task
+
+        items = asyncio.run(run_case())
+
+        self.assertEqual(items, [])
+        self.assertEqual(first.get_extra(EXTRA_DECISION), "SKIP")
+        self.assertEqual(first.get_extra(EXTRA_REASON), "input_context_waiting_for_more")
+        self.assertTrue(first._force_stopped)
+
+    def test_private_event_latest_message_replies_once(self) -> None:
+        plugin = build_plugin(
+            {
+                "input_context_debounce_sec": 0.02,
+                "input_context_wait_sec": 0.02,
+            },
+        )
+        plugin._get_or_create_conversation = _return_conversation
+        first = FakeEvent(
+            group_id="private-a",
+            sender_id="user-a",
+            text="please wait for the next part",
+            message_type="FRIEND_MESSAGE",
+        )
+        second = FakeEvent(
+            group_id="private-a",
+            sender_id="user-a",
+            text="this is the actual second part",
+            message_type="FRIEND_MESSAGE",
+        )
+
+        async def run_case():
+            await plugin.record_input_context(first)
+            first_task = asyncio.create_task(_collect_async(plugin.smart_private_reply(first)))
+            await asyncio.sleep(0.005)
+            await plugin.record_input_context(second)
+            await first_task
+            return await _collect_async(plugin.smart_private_reply(second))
+
+        items = asyncio.run(run_case())
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].prompt, "this is the actual second part")
+        self.assertEqual(second.get_extra(EXTRA_DECISION), "REPLY")
+        self.assertEqual(second.get_extra(EXTRA_REASON), "private_input_debounce")
+        self.assertTrue(second._force_stopped)
+
+    def test_private_event_latest_message_replies_while_first_is_still_waiting(self) -> None:
+        plugin = build_plugin(
+            {
+                "input_context_debounce_sec": 0.02,
+                "private_input_debounce_sec": 0.05,
+                "input_context_wait_sec": 0.02,
+            },
+        )
+        plugin._get_or_create_conversation = _return_conversation
+        first = FakeEvent(
+            group_id="private-a",
+            sender_id="user-a",
+            text="please wait for the next part",
+            message_type="FRIEND_MESSAGE",
+        )
+        second = FakeEvent(
+            group_id="private-a",
+            sender_id="user-a",
+            text="this is the actual second part",
+            message_type="FRIEND_MESSAGE",
+        )
+
+        async def run_case():
+            await plugin.record_input_context(first)
+            first_task = asyncio.create_task(_collect_async(plugin.smart_private_reply(first)))
+            await asyncio.sleep(0.005)
+            await plugin.record_input_context(second)
+            items = await _collect_async(plugin.smart_private_reply(second))
+            await first_task
+            return items
+
+        items = asyncio.run(run_case())
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].prompt, "this is the actual second part")
+        self.assertEqual(second.get_extra(EXTRA_DECISION), "REPLY")
+        self.assertEqual(second.get_extra(EXTRA_REASON), "private_input_debounce")
+        self.assertEqual(first.get_extra(EXTRA_DECISION), "SKIP")
 
     def test_full_question_does_not_wait_for_more_input_context(self) -> None:
         plugin = build_plugin(
@@ -934,6 +1270,86 @@ class DirectedReplyGuardTest(unittest.TestCase):
         elapsed = time.perf_counter() - started
 
         self.assertLess(elapsed, 0.08)
+
+    def test_plain_private_reply_defers_when_sender_continues(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "input_context_debounce_sec": 0.02,
+                "input_context_wait_sec": 0.02,
+            },
+        )
+        first = FakeEvent(
+            group_id="private-a",
+            sender_id="user-a",
+            text="先等等",
+            message_type="FRIEND_MESSAGE",
+        )
+        second = FakeEvent(
+            group_id="private-a",
+            sender_id="user-a",
+            text="我还没说完",
+            message_type="FRIEND_MESSAGE",
+        )
+        request = ProviderRequest(system_prompt="base prompt")
+
+        async def run_case() -> None:
+            await plugin.record_input_context(first)
+            private_task = asyncio.create_task(
+                _collect_async(plugin.smart_private_reply(first)),
+            )
+            await asyncio.sleep(0.005)
+            await plugin.record_input_context(second)
+            items = await private_task
+            self.assertEqual(items, [])
+
+        asyncio.run(run_case())
+
+        self.assertEqual(first.get_extra(EXTRA_DECISION), "SKIP")
+        self.assertEqual(first.get_extra(EXTRA_REASON), "input_context_waiting_for_more")
+        self.assertTrue(first._force_stopped)
+
+    def test_plain_private_latest_message_keeps_recent_input_context(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "input_context_debounce_sec": 0.02,
+                "input_context_wait_sec": 0.02,
+            },
+        )
+        first = FakeEvent(
+            group_id="private-a",
+            sender_id="user-a",
+            text="先等等",
+            message_type="FRIEND_MESSAGE",
+        )
+        second = FakeEvent(
+            group_id="private-a",
+            sender_id="user-a",
+            text="我还没说完",
+            message_type="FRIEND_MESSAGE",
+        )
+        request = ProviderRequest(system_prompt="base prompt")
+
+        async def run_case() -> None:
+            await plugin.record_input_context(first)
+            first_task = asyncio.create_task(
+                _collect_async(plugin.smart_private_reply(first)),
+            )
+            await asyncio.sleep(0.005)
+            await plugin.record_input_context(second)
+            await first_task
+            plugin._get_or_create_conversation = _return_conversation
+            items = await _collect_async(plugin.smart_private_reply(second))
+            self.assertEqual(len(items), 1)
+            request.prompt = items[0].prompt
+            second.set_extra(EXTRA_INPUT_QUIET_CHECKED, True)
+            await plugin.decorate_llm_request(second, request)
+
+        asyncio.run(run_case())
+
+        self.assertIn("sender: 先等等", request.system_prompt)
+        self.assertIn("sender: 我还没说完", request.system_prompt)
 
     def test_recent_group_context_injection_can_be_disabled(self) -> None:
         plugin = build_plugin(
