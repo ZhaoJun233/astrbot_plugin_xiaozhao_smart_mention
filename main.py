@@ -91,8 +91,8 @@ CHAT_HEADING_PREFIX_RE = re.compile(
     r"^\s*(?P<title>[^。\n！？!?]{1,30}(?:评价|看法|分析|总结|回复|说明|建议|吐槽|结论|回答|判断))[:：]?\s*",
 )
 CHAT_BOLD_HEADING_PREFIX_RE = re.compile(r"^\s*\*{1,2}(?P<title>[^*\n]{1,40}?)\*{1,2}\s*")
-CHAT_SENTENCE_RE = re.compile(r"[^。！？!?…~～]+[。！？!?…~～]+(?:[❤️❤💕💖✨~～]*)|[^。！？!?…~～]+$")
-ISOLATED_PUNCTUATION_RE = re.compile(r"^[。！？!?，,、；;：:…~～—\-]+$")
+CHAT_SENTENCE_RE = re.compile(r'[^。！？!?…~～]+[。！？!?…~～]+(?:["”’」』）)\]]*)(?:[❤️❤💕💖✨~～]*)|[^。！？!?…~～]+$')
+ISOLATED_PUNCTUATION_RE = re.compile(r'^[。！？!?，,、；;：:…~～—\-]+["”’」』）)\]]*$')
 STRUCTURED_REPLY_MARKERS = (
     "```",
     "`",

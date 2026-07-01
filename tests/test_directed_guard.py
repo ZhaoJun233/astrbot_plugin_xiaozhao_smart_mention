@@ -1612,6 +1612,19 @@ class DirectedReplyGuardTest(unittest.TestCase):
             ),
         )
 
+    def test_local_segments_keep_closing_double_quote_with_inner_punctuation(self) -> None:
+        text = (
+            '小昭认真点头说："主人别急！"然后把事情讲清楚。'
+            '她又补了一句："这次不会乱拆。"最后安静等主人确认。'
+        )
+
+        formatted = _format_natural_chat_paragraphs(text)
+
+        self.assertNotIn('\n\n"', formatted)
+        self.assertIn('"主人别急！"', formatted)
+        self.assertIn('"这次不会乱拆。"', formatted)
+        self.assertEqual(formatted.replace("\n\n", ""), text)
+
     def test_local_segment_fallback_respects_configured_safety_limit(self) -> None:
         text = (
             "呜……被主人抓到了喵。小昭说的待命中是日常用语的那个意思。"
@@ -1673,6 +1686,15 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertEqual(
             _normalise_model_segments(original, raw, 5),
             ["。小昭在呢，主人别急。", "后面慢慢说。"],
+        )
+
+    def test_model_segments_absorb_punctuation_with_closing_double_quote(self) -> None:
+        original = '小昭说："主人别急！"然后继续解释。'
+        raw = '{"segments":["小昭说：\\"主人别急","！\\"","然后继续解释。"]}'
+
+        self.assertEqual(
+            _normalise_model_segments(original, raw, 5),
+            ['小昭说："主人别急！"', "然后继续解释。"],
         )
 
     def test_high_configured_limit_is_only_a_safety_cap(self) -> None:
