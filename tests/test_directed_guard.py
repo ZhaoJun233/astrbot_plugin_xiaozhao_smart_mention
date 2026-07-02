@@ -727,7 +727,7 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertEqual(items, [])
         self.assertIsNone(other_sender.get_extra(EXTRA_DECISION))
 
-    def test_recent_followup_window_uses_weighted_model_score_when_text_has_no_cue(self) -> None:
+    def test_recent_followup_window_uses_model_reply_when_text_has_no_cue(self) -> None:
         plugin = build_plugin(
             {
                 "mention_keywords": ["小昭"],
@@ -749,7 +749,37 @@ class DirectedReplyGuardTest(unittest.TestCase):
 
         self.assertEqual(len(items), 1)
         self.assertEqual(casual.get_extra(EXTRA_DECISION), "REPLY")
-        self.assertTrue(casual.get_extra(EXTRA_REASON).startswith("followup_score:"))
+        self.assertTrue(casual.get_extra(EXTRA_REASON).startswith("followup_model:"))
+
+    def test_recent_followup_window_allows_model_semantic_reply_without_cue(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "followup_reply_window_sec": 180,
+            },
+        )
+        plugin._get_or_create_conversation = _return_conversation
+        plugin._followup_decide = _return_reply
+
+        first = FakeEvent(
+            group_id="group-a",
+            sender_id="user-a",
+            text="小昭先帮我看看这个问题",
+        )
+        asyncio.run(plugin.smart_mention(first))
+
+        semantic_followup = FakeEvent(
+            group_id="group-a",
+            sender_id="user-a",
+            text="我想换个角度看这件事",
+        )
+        items = list(asyncio.run(_collect_async(plugin.smart_active_reply(semantic_followup))))
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(semantic_followup.get_extra(EXTRA_DECISION), "REPLY")
+        self.assertTrue(
+            semantic_followup.get_extra(EXTRA_REASON).startswith("followup_model:")
+        )
 
     def test_recent_followup_window_respects_model_skip_without_cue(self) -> None:
         plugin = build_plugin(

@@ -1078,15 +1078,24 @@ class Main(Star):
             and followup_reason == "no_followup_reply_cue"
             and self.followup_llm_judge_enabled
         ):
-            followup_decision = await self._followup_decide(event, text)
-            score, score_reasons = self._score_followup_reply(
+            in_window, window_reason = self._recent_followup_reply_reason(
                 event,
                 text,
-                model_replied=followup_decision == "REPLY",
+                require_cue=False,
             )
-            if score >= self.followup_score_threshold:
-                followup_allowed = True
-                followup_reason = f"followup_score:{score}/{self.followup_score_threshold}:{','.join(score_reasons)}"
+            if in_window:
+                followup_decision = await self._followup_decide(event, text)
+                score, score_reasons = self._score_followup_reply(
+                    event,
+                    text,
+                    model_replied=followup_decision == "REPLY",
+                )
+                if followup_decision == "REPLY" and "short_ack" not in score_reasons:
+                    followup_allowed = True
+                    followup_reason = f"followup_model:{window_reason}"
+                elif score >= self.followup_score_threshold:
+                    followup_allowed = True
+                    followup_reason = f"followup_score:{score}/{self.followup_score_threshold}:{','.join(score_reasons)}"
         if followup_allowed:
             if await self._defer_reply_if_input_continues(event):
                 return
