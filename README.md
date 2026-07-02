@@ -175,7 +175,7 @@ git clone https://github.com/ZhaoJun233/astrbot_plugin_xiaozhao_smart_mention.gi
 
 ### 续聊窗口
 
-当小昭刚刚回复过某个发送者后，插件会记录这个“当前对话目标”。在 `followup_reply_window_sec` 秒内，如果同一群、同一机器人、同一发送者继续发出像追问、纠正、要求直接回答，或“评价一下/分析一下/讲讲/说说”这类明确让它接着处理某个主题的消息，即使没有再次提到 `mention_keywords`，插件也会接着回复。若 `followup_llm_judge_enabled=true`，没有命中固定追问词的自然接话会先走本地评分：高分直接续聊，低分直接跳过，只有落在 `followup_model_judge_min_score` 到 `followup_model_judge_max_score` 的灰区才请求当前模型做语义判定。
+当小昭刚刚回复过某个发送者后，插件会记录这个“当前对话目标”。在 `followup_reply_window_sec` 秒内，如果同一群、同一机器人、同一发送者继续发出像追问、纠正、要求直接回答，或“评价一下/分析一下/讲讲/说说”“说你呢/问你呢”这类明确让它接着处理某个主题的消息，即使没有再次提到 `mention_keywords`，插件也会接着回复。若 `followup_llm_judge_enabled=true`，没有命中固定追问词的自然接话会先走本地评分：高分直接续聊，低分直接跳过，只有落在 `followup_model_judge_min_score` 到 `followup_model_judge_max_score` 的灰区才请求当前模型做语义判定。
 
 该机制只对同一发送者生效，别人插话不会继承这个窗口；“好的”“嗯”“哈哈”“通过了”等短反馈默认会被 `short_ack` 扣分拦住。续聊在主动回复或续聊回复之后也会尊重 `active_reply_cooldown_sec` 和 `followup_max_auto_rounds`，避免同一段无关键词对话被一句一句接管；明确点名仍走点名逻辑。如果觉得续聊太积极，可以提高 `followup_score_threshold`、调低 `followup_model_weight`、关闭 `followup_llm_judge_enabled`，或把 `followup_reply_window_sec` 调小。
 

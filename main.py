@@ -149,6 +149,7 @@ DEFAULT_FOLLOWUP_REPLY_CUE_PATTERNS = [
     r"(?:告诉我|直接说|直说|回答|继续|接着|就行|没事|好奇|问问)",
     r"(?:评价|锐评|分析|解释|总结|讲讲|说说|聊聊|展开|展开说说)(?:一下)?",
     r"(?:你觉得|你认为|你猜|猜一下|选一个|到底|所以|那你|那么)",
+    r"(?:说你呢|叫你呢|问你呢|跟你说|和你说)",
     r"(?:不是|不对|我是说|我问的是|别绕|别跑题|刚才|上一句)",
 ]
 DEFAULT_FOLLOWUP_SCORE_WEIGHTS = {
@@ -163,7 +164,7 @@ DEFAULT_FOLLOWUP_SCORE_WEIGHTS = {
     "model_reply": 30,
 }
 FOLLOWUP_ASKS_BOT_RE = re.compile(
-    r"(?:你|小昭|bot|机器人|怎么|咋|如何|为什么|为啥|啥|什么|哪个|多少|几点|能不能|可不可以)",
+    r"(?:你|小昭|bot|机器人|怎么|咋|如何|为什么|为啥|啥|什么|哪个|多少|几点|能不能|可不可以|说你呢|叫你呢|问你呢|跟你说|和你说)",
     re.IGNORECASE,
 )
 FOLLOWUP_PREVIOUS_REPLY_RE = re.compile(

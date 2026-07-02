@@ -678,6 +678,30 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertEqual(followup_spy.calls, 0)
         self.assertTrue(followup.get_extra(EXTRA_REASON).startswith("followup_window:"))
 
+    def test_recent_followup_directed_pronoun_replies_without_model_judge(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "active_reply_cooldown_sec": 0,
+                "followup_reply_window_sec": 180,
+                "followup_score_threshold": 60,
+            },
+        )
+        plugin._get_or_create_conversation = _return_conversation
+        followup_spy = FollowupDecisionSpy("SKIP")
+        plugin._followup_decide = followup_spy
+
+        first = FakeEvent(group_id="665018346", sender_id="3040470862", text="小昭")
+        asyncio.run(plugin.smart_mention(first))
+
+        followup = FakeEvent(group_id="665018346", sender_id="3040470862", text="说你呢")
+        items = list(asyncio.run(_collect_async(plugin.smart_active_reply(followup))))
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(followup_spy.calls, 0)
+        self.assertEqual(followup.get_extra(EXTRA_DECISION), "REPLY")
+        self.assertTrue(followup.get_extra(EXTRA_REASON).startswith("followup_window:"))
+
     def test_recent_followup_low_score_plain_statement_skips_without_model_judge(self) -> None:
         plugin = build_plugin(
             {
