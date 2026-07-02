@@ -763,6 +763,14 @@ class Main(Star):
             self.config.get("followup_score_threshold"),
             75,
         )
+        self.followup_model_judge_min_score = _as_int(
+            self.config.get("followup_model_judge_min_score"),
+            35,
+        )
+        self.followup_model_judge_max_score = _as_int(
+            self.config.get("followup_model_judge_max_score"),
+            70,
+        )
         self.followup_model_weight = _as_int(
             self.config.get("followup_model_weight"),
             DEFAULT_FOLLOWUP_SCORE_WEIGHTS["model_reply"],
@@ -1084,18 +1092,23 @@ class Main(Star):
                 require_cue=False,
             )
             if in_window:
-                followup_decision = await self._followup_decide(event, text)
                 score, score_reasons = self._score_followup_reply(
                     event,
                     text,
-                    model_replied=followup_decision == "REPLY",
                 )
-                if followup_decision == "REPLY" and "short_ack" not in score_reasons:
-                    followup_allowed = True
-                    followup_reason = f"followup_model:{window_reason}"
-                elif score >= self.followup_score_threshold:
+                if score >= self.followup_score_threshold:
                     followup_allowed = True
                     followup_reason = f"followup_score:{score}/{self.followup_score_threshold}:{','.join(score_reasons)}"
+                elif (
+                    "short_ack" not in score_reasons
+                    and self.followup_model_judge_min_score
+                    <= score
+                    <= self.followup_model_judge_max_score
+                ):
+                    followup_decision = await self._followup_decide(event, text)
+                    if followup_decision == "REPLY":
+                        followup_allowed = True
+                        followup_reason = f"followup_model:{window_reason}:score={score}"
         if followup_allowed:
             if await self._defer_reply_if_input_continues(event):
                 return

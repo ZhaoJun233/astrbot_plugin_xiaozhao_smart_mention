@@ -133,19 +133,31 @@
   },
   "followup_llm_judge_enabled": {
     "description": "模型判断续聊",
-    "hint": "开启后，续聊窗口内同一发送者即使没有命中固定追问词，也会交给当前模型做语义判定；关闭后只按固定续聊规则触发。",
+    "hint": "开启后，续聊窗口内同一发送者没有命中固定追问词时，会先本地评分，只在灰区交给当前模型做语义判定；关闭后只按固定续聊规则触发。",
     "type": "bool",
     "default": true
   },
   "followup_score_threshold": {
     "description": "续聊触发分数",
-    "hint": "固定规则评分触发续聊的阈值。分数越高越保守；短反馈仍会被扣分拦截，模型明确判定续聊时不依赖该阈值。",
+    "hint": "固定规则评分触发续聊的阈值。达到该分数会直接续聊，不再请求模型；短反馈仍会被扣分拦截。",
     "type": "int",
     "default": 75
   },
+  "followup_model_judge_min_score": {
+    "description": "模型续聊灰区下限",
+    "hint": "未命中固定续聊规则时，本地评分低于该值会直接跳过，不请求模型，以节省成本。",
+    "type": "int",
+    "default": 35
+  },
+  "followup_model_judge_max_score": {
+    "description": "模型续聊灰区上限",
+    "hint": "未命中固定续聊规则时，本地评分在下限和该值之间才请求模型；高于该值但未达触发分数时仍按本地规则处理。",
+    "type": "int",
+    "default": 70
+  },
   "followup_model_weight": {
     "description": "续聊模型加分",
-    "hint": "兼容旧评分路径的模型加分；当前主要由模型语义判定直接决定是否续聊。",
+    "hint": "兼容旧评分路径的模型加分，保留给自定义权重使用。",
     "type": "int",
     "default": 30
   },

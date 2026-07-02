@@ -329,6 +329,16 @@ async def _return_reply(event, text):
     return "REPLY"
 
 
+class FollowupDecisionSpy:
+    def __init__(self, decision: str = "REPLY") -> None:
+        self.decision = decision
+        self.calls = 0
+
+    async def __call__(self, event, text):
+        self.calls += 1
+        return self.decision
+
+
 async def _return_conversation(event):
     return object()
 
@@ -646,6 +656,49 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertEqual(followup.get_extra(EXTRA_DECISION), "REPLY")
         self.assertTrue(followup.get_extra(EXTRA_REASON).startswith("followup_window:"))
 
+    def test_recent_followup_rule_match_does_not_call_model_judge(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "active_reply_cooldown_sec": 30,
+                "followup_reply_window_sec": 180,
+            },
+        )
+        plugin._get_or_create_conversation = _return_conversation
+        followup_spy = FollowupDecisionSpy("SKIP")
+        plugin._followup_decide = followup_spy
+
+        first = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭")
+        asyncio.run(plugin.smart_mention(first))
+
+        followup = FakeEvent(group_id="group-a", sender_id="user-a", text="继续讲讲这个")
+        items = list(asyncio.run(_collect_async(plugin.smart_active_reply(followup))))
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(followup_spy.calls, 0)
+        self.assertTrue(followup.get_extra(EXTRA_REASON).startswith("followup_window:"))
+
+    def test_recent_followup_low_score_plain_statement_skips_without_model_judge(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "followup_reply_window_sec": 180,
+            },
+        )
+        plugin._get_or_create_conversation = _return_conversation
+        followup_spy = FollowupDecisionSpy("REPLY")
+        plugin._followup_decide = followup_spy
+
+        first = FakeEvent(group_id="group-a", sender_id="user-a", text="小昭")
+        asyncio.run(plugin.smart_mention(first))
+
+        followup = FakeEvent(group_id="group-a", sender_id="user-a", text="今天群里人好多")
+        items = list(asyncio.run(_collect_async(plugin.smart_active_reply(followup))))
+
+        self.assertEqual(items, [])
+        self.assertEqual(followup_spy.calls, 0)
+        self.assertIsNone(followup.get_extra(EXTRA_DECISION))
+
     def test_recent_same_sender_followup_handles_imperative_topic_request(self) -> None:
         plugin = build_plugin(
             {
@@ -771,7 +824,7 @@ class DirectedReplyGuardTest(unittest.TestCase):
         semantic_followup = FakeEvent(
             group_id="group-a",
             sender_id="user-a",
-            text="我想换个角度看这件事",
+            text="你还能从另一个角度看这件事",
         )
         items = list(asyncio.run(_collect_async(plugin.smart_active_reply(semantic_followup))))
 
