@@ -646,6 +646,30 @@ class DirectedReplyGuardTest(unittest.TestCase):
         self.assertEqual(followup.get_extra(EXTRA_DECISION), "REPLY")
         self.assertTrue(followup.get_extra(EXTRA_REASON).startswith("followup_window:"))
 
+    def test_recent_same_sender_followup_handles_imperative_topic_request(self) -> None:
+        plugin = build_plugin(
+            {
+                "mention_keywords": ["小昭"],
+                "active_reply_cooldown_sec": 30,
+                "followup_reply_window_sec": 180,
+            },
+        )
+        plugin._get_or_create_conversation = _return_conversation
+
+        first = FakeEvent(group_id="665018346", sender_id="3040470862", text="小昭")
+        asyncio.run(plugin.smart_mention(first))
+
+        followup = FakeEvent(
+            group_id="665018346",
+            sender_id="3040470862",
+            text="评价一下青梅煮酒论英雄",
+        )
+        items = list(asyncio.run(_collect_async(plugin.smart_active_reply(followup))))
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(followup.get_extra(EXTRA_DECISION), "REPLY")
+        self.assertTrue(followup.get_extra(EXTRA_REASON).startswith("followup_window:"))
+
     def test_followup_reply_respects_active_reply_cooldown_after_active_reply(self) -> None:
         plugin = build_plugin(
             {
